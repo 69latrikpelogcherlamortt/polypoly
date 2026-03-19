@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p core signals trading dashboard docs)",
+      "Bash(cp config.py core/)",
+      "Bash(cp database.py core/)",
+      "Bash(cp crucix_router.py signals/)",
+      "Bash(cp signal_sources.py signals/)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''dashboard_server.py''\\).read\\(\\)\\); print\\(''OK — aucune erreur syntaxe''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(find /d/BotPolymarket -type f -name *.js -o -name *.json -o -name *.ts -o -name *.tsx -o -name *.py -o -name *.html -o -name *.css -o -name *.yml -o -name *.yaml -o -name *.md)",
+      "Bash(wc -l /d/BotPolymarket/main.py /d/BotPolymarket/dashboard_server.py /d/BotPolymarket/core/*.py /d/BotPolymarket/signals/*.py /d/BotPolymarket/trading/*.py)",
+      "Bash(find /d/BotPolymarket -type f -exec ls -lh {})",
+      "Read(//d/BotPolymarket/**)",
+      "Bash(python -m py_compile core/config.py)",
+      "Bash(python -m py_compile core/database.py)",
+      "Bash(python -m py_compile signals/prob_model.py)",
+      "Bash(python -m py_compile signals/signal_sources.py)",
+      "Bash(python -m py_compile signals/crucix_router.py)",
+      "Bash(pip show:*)",
+      "Bash(pip list:*)",
+      "Bash(python -c \"import numpy; print\\(''numpy:'', numpy.__version__\\); import scipy; print\\(''scipy:'', scipy.__version__\\); import aiohttp; print\\(''aiohttp:'', aiohttp.__version__\\); import requests; print\\(''requests:'', requests.__version__\\)\")",
+      "Bash(python -c \"import feedparser; print\\(''feedparser:'', feedparser.__version__\\); import sentence_transformers; print\\(''sentence-transformers:'', sentence_transformers.__version__\\)\")",
+      "Bash(python -c \"import py_clob_client; print\\(''py_clob_client OK''\\)\")",
+      "Bash(python -c \"import sklearn; print\\(''sklearn:'', sklearn.__version__\\)\")",
+      "Bash(python -c \"import pandas; print\\(''pandas:'', pandas.__version__\\)\")",
+      "Bash(python -c \"import py_clob_client; print\\(''py-clob-client:'', py_clob_client.__version__\\)\")",
+      "Bash(python -c \"import sentence_transformers; print\\(''sentence-transformers:'', sentence_transformers.__version__\\)\")",
+      "Bash(python -c \"import asyncio_throttle; print\\(''asyncio-throttle: OK''\\)\")"
+    ]
+  }
+}
