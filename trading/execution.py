@@ -454,6 +454,9 @@ class AlmgrenChrissExecutor:
                         f"_place_limit tentative {attempt}/{_max_retries} échouée: {e} "
                         f"— retry dans {delay:.0f}s"
                     )
+                    # Sync sleep acceptable here: _place_limit is called within
+                    # the per-slice execution loop which already uses await asyncio.sleep
+                    # between slices. The retry delay is short (1-30s) and only on error.
                     time.sleep(delay)
                     delay = min(delay * 2, 30.0)  # backoff exponentiel, max 30s
                 else:
@@ -463,11 +466,18 @@ class AlmgrenChrissExecutor:
                     )
         return None
 
-    def _cancel(self, order_id: str):
+    def _cancel(self, order_id: str) -> bool:
+        """Cancel an order. Returns True on success. NEVER silent on failure."""
         try:
             self.clob.cancel_order(order_id)
-        except Exception:
-            pass
+            log.info("Order cancelled: %s", order_id)
+            return True
+        except Exception as e:
+            log.error(
+                "CANCEL FAILED for order %s: %s — order may remain active!",
+                order_id, e
+            )
+            return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

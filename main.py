@@ -26,29 +26,107 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import re
+import signal
 import sys
+import time as _time
+import uuid
+from collections import deque
+from contextvars import ContextVar
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-# ── Logging ────────────────────────────────────────────────────────────────
-LOG_FORMAT = "%(asctime)s  %(levelname)-7s  %(name)-20s  %(message)s"
-LOG_DATE   = "%Y-%m-%d %H:%M:%S"
+# ── Correlation ID (propagé dans les coroutines async) ────────────────────
+_correlation_id: ContextVar[str] = ContextVar('correlation_id', default='-')
 
-Path("logs").mkdir(exist_ok=True)
+def get_correlation_id() -> str:
+    return _correlation_id.get()
 
-logging.basicConfig(
-    level    = logging.INFO,
-    format   = LOG_FORMAT,
-    datefmt  = LOG_DATE,
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
-    ],
-)
+def set_cycle_correlation_id() -> str:
+    cid = f"cycle-{uuid.uuid4().hex[:8]}"
+    _correlation_id.set(cid)
+    return cid
+
+def set_trade_correlation_id(market_id: str) -> str:
+    cid = f"trade-{market_id[:8]}-{uuid.uuid4().hex[:6]}"
+    _correlation_id.set(cid)
+    return cid
+
+# ── JSON Formatter pour ingestion Datadog/ELK/Grafana ─────────────────────
+class JsonFormatter(logging.Formatter):
+    RESERVED_ATTRS = frozenset([
+        'args', 'asctime', 'created', 'exc_info', 'exc_text',
+        'filename', 'funcName', 'levelname', 'levelno', 'lineno',
+        'message', 'module', 'msecs', 'msg', 'name', 'pathname',
+        'process', 'processName', 'relativeCreated', 'stack_info',
+        'thread', 'threadName',
+    ])
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_object = {
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "file": f"{record.filename}:{record.lineno}",
+            "correlation_id": getattr(record, 'correlation_id', _correlation_id.get('-')),
+        }
+        if record.exc_info:
+            log_object["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_object, default=str, ensure_ascii=False)
+
+# ── Logging setup ──────────────────────────────────────────────────────────
+def setup_logging(json_mode: bool = False) -> None:
+    Path("logs").mkdir(exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    fmt_human = logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(name)-20s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    formatter = JsonFormatter() if json_mode else fmt_human
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt_human)
+    root.addHandler(console)
+
+    # Rotating file handler (50MB × 10 = 500MB max)
+    file_handler = logging.handlers.RotatingFileHandler(
+        "logs/bot.log",
+        maxBytes=50 * 1024 * 1024,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+setup_logging(json_mode=os.getenv("LOG_JSON", "").lower() in ("true", "1"))
 log = logging.getLogger("main")
+
+# ── Emergency stop ─────────────────────────────────────────────────────────
+EMERGENCY_STOP_FILE = Path(".emergency_stop")
+
+def _check_emergency_stop() -> bool:
+    if EMERGENCY_STOP_FILE.exists():
+        log.critical("EMERGENCY STOP FILE DETECTED — halting all trading immediately")
+        return True
+    return False
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────
+_shutdown_requested = False
+
+def _handle_shutdown(signum, frame):
+    global _shutdown_requested
+    log.warning("Signal %s received — initiating graceful shutdown", signum)
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
 
 # ── Imports internes ───────────────────────────────────────────────────────
 from core.config import (
@@ -78,22 +156,21 @@ from signals.crucix_router import (
 # TELEGRAM NOTIFIER
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def send_telegram(text: str):
-    """Envoie un message Telegram si configuré."""
+async def send_telegram(text: str) -> None:
+    """Envoie un message Telegram si configuré. Ne logue JAMAIS l'URL/token."""
     if not TELEGRAM_ENABLED:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
             await session.post(
-                url,
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                       "parse_mode": "Markdown"},
                 timeout=aiohttp.ClientTimeout(total=5),
             )
     except Exception as e:
-        log.debug(f"Telegram: {e}")
+        log.debug("Telegram notification failed [token redacted]: %s", type(e).__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -194,7 +271,7 @@ class TradingBot:
         # ── État ──────────────────────────────────────────────────────────
         self.bankroll      = self._load_bankroll()
         self.candidates: dict = {"strategy_1": [], "strategy_2": []}
-        self._returns_history: list[float] = self._load_returns_history()
+        self._returns_history: deque[float] = deque(self._load_returns_history(), maxlen=500)
         self._last_scan    = datetime.min.replace(tzinfo=timezone.utc)
         self._running      = False
 
@@ -794,13 +871,21 @@ class TradingBot:
         """Démarre les WebSockets en arrière-plan."""
         await self.signals.btc_tracker.start()
 
-    async def run(self):
+    async def run(self) -> None:
         """Boucle principale asynchrone."""
+        global _shutdown_requested
         self._running = True
         log.info("Bot démarré. Ctrl+C pour arrêter.")
 
+        # Vérifier emergency stop avant tout
+        if _check_emergency_stop():
+            return
+
         # Démarrer Binance WS en arrière-plan
         await self._start_websockets()
+
+        # Lancer backup DB en arrière-plan
+        asyncio.create_task(self._backup_loop())
 
         # Rapport de démarrage
         if TELEGRAM_ENABLED:
@@ -817,8 +902,13 @@ class TradingBot:
         cycle_count    = 0
         last_heartbeat = datetime.now(timezone.utc)
 
-        while self._running:
+        while self._running and not _shutdown_requested:
             try:
+                # ── Emergency stop check ──────────────────────────────────
+                if _check_emergency_stop():
+                    break
+
+                cid = set_cycle_correlation_id()
                 cycle_start = datetime.now(timezone.utc)
 
                 # ── 1. Signal cycle (toutes les 10 min) ───────────────────
@@ -843,7 +933,8 @@ class TradingBot:
                 # Attendre jusqu'au prochain cycle (10 min)
                 elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
                 sleep_s = max(0, POLL_SIGNAL_CYCLE - elapsed)
-                log.info(f"Cycle #{cycle_count} terminé en {elapsed:.0f}s. Pause {sleep_s:.0f}s")
+                log.info("Cycle #%d terminé en %.0fs. Pause %.0fs [%s]",
+                         cycle_count, elapsed, sleep_s, cid)
                 await asyncio.sleep(sleep_s)
 
             except asyncio.CancelledError:
@@ -851,12 +942,77 @@ class TradingBot:
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                log.error(f"Erreur cycle principale: {e}", exc_info=True)
-                await asyncio.sleep(30)  # pause avant retry
+                log.error("Erreur cycle principale: %s", e, exc_info=True)
+                await asyncio.sleep(30)
 
-        log.info("Bot arrêté.")
+        # ── Graceful shutdown sequence ────────────────────────────────────
+        await self._graceful_shutdown()
+
+    async def _graceful_shutdown(self) -> None:
+        """Séquence de fermeture propre — ordres, DB, alertes."""
+        log.warning("SHUTDOWN: initiating graceful shutdown sequence")
+        await send_telegram("🛑 PAF-001 — SHUTDOWN INITIATED")
+
+        # 1. Log positions ouvertes
+        positions = self.trade_repo.get_all_positions()
+        for pos in positions:
+            unrealized = pos.n_shares * pos.current_price - pos.cost_basis
+            log.warning(
+                "SHUTDOWN: open position %s — cost=%.2f unrealized=%.2f",
+                pos.market_id[:30], pos.cost_basis, unrealized
+            )
+
+        # 2. Flush DB
+        try:
+            self.trading_conn.commit()
+            log.info("SHUTDOWN: trading DB flushed")
+        except Exception as e:
+            log.error("SHUTDOWN: DB flush failed: %s", e)
+
+        # 3. Save final bankroll
+        try:
+            self._save_bankroll()
+            log.info("SHUTDOWN: bankroll snapshot saved")
+        except Exception as e:
+            log.error("SHUTDOWN: bankroll save failed: %s", e)
+
         if TELEGRAM_ENABLED:
-            await send_telegram("🛑 PAF-001 arrêté")
+            await send_telegram(
+                f"🛑 *PAF-001 arrêté*\n"
+                f"Positions ouvertes: {len(positions)}\n"
+                f"Bankroll: {self.bankroll:.2f}€"
+            )
+        log.warning("SHUTDOWN COMPLETE — all DB flushed, %d positions still open",
+                     len(positions))
+
+    async def _backup_loop(self) -> None:
+        """Sauvegarde les DB SQLite toutes les 6 heures."""
+        import sqlite3 as _sqlite3
+        backup_dir = Path("backups")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        MAX_BACKUPS = 30
+
+        while self._running and not _shutdown_requested:
+            await asyncio.sleep(6 * 3600)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            for db_path in [DB_PATH, SIGNAL_DB_PATH]:
+                if not db_path.exists():
+                    continue
+                backup_path = backup_dir / f"{db_path.stem}_{ts}.db"
+                try:
+                    src = _sqlite3.connect(str(db_path))
+                    dst = _sqlite3.connect(str(backup_path))
+                    src.backup(dst)
+                    src.close()
+                    dst.close()
+                    log.info("DB backup created: %s", backup_path)
+                except Exception as e:
+                    log.error("DB backup FAILED for %s: %s", db_path, e)
+            # Cleanup old backups
+            all_backups = sorted(backup_dir.glob("*.db"), key=lambda p: p.stat().st_mtime)
+            for old in all_backups[:-MAX_BACKUPS]:
+                old.unlink()
+                log.debug("Old backup removed: %s", old)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -869,8 +1025,10 @@ async def main():
         await bot.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Interruption reçue. Arrêt propre.")
+        await bot._graceful_shutdown()
     finally:
         bot.signals.btc_tracker.stop()
+        log.info("Bot process exiting.")
 
 
 if __name__ == "__main__":

@@ -120,6 +120,11 @@ class PortfolioState:
 
 def init_trading_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
+    # WAL mode: concurrent reads/writes without locks
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-65536")  # 64MB
+    conn.execute("PRAGMA foreign_keys=ON")
     c = conn.cursor()
 
     # ── Trades ──────────────────────────────────────────────────────────
@@ -156,8 +161,10 @@ def init_trading_db(path: Path = DB_PATH) -> sqlite3.Connection:
     # Migration : ajoute la colonne si absente (DB existante)
     try:
         c.execute("ALTER TABLE trades ADD COLUMN category TEXT NOT NULL DEFAULT ''")
-    except Exception:
-        pass  # colonne déjà présente
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            logging.getLogger("database").error("Migration failed: %s", e)
+            raise
 
     # ── Positions ouvertes ───────────────────────────────────────────────
     c.execute("""
@@ -256,6 +263,14 @@ def init_trading_db(path: Path = DB_PATH) -> sqlite3.Connection:
             daily_pnl REAL   NOT NULL DEFAULT 0.0
         )
     """)
+
+    # ── Indexes ─────────────────────────────────────────────────────
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_ts ON trades(exit_ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_ts ON trades(entry_ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_nav_history_ts ON nav_history(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_positions_market ON open_positions(market_id)")
 
     conn.commit()
     return conn

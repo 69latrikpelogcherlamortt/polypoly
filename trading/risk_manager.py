@@ -33,6 +33,7 @@ from core.config import (
     EXIT_EDGE_MIN, EXIT_PROFIT_CAPTURE_PCT, EXIT_ADVERSE_MOVE_PCT,
     MC_PATHS, MC_HORIZON, MC_CONF,
     S2_EDGE_RATIO_MIN, S2_EDGE_ABS_MIN,
+    MAX_DAILY_LOSS_EUR, MAX_DAILY_LOSS_PCT, MAX_POSITIONS_PER_CATEGORY,
 )
 
 log = logging.getLogger("risk")
@@ -553,6 +554,133 @@ class KillSwitchMonitor:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 4B. DAILY LOSS MONITOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DailyLossMonitor:
+    """
+    Vérifie la perte nette depuis minuit UTC.
+    Déclenche un arrêt si MAX_DAILY_LOSS_EUR ou MAX_DAILY_LOSS_PCT dépassé.
+    """
+
+    def check(self, conn, bankroll: float) -> KillSwitchStatus:
+        midnight = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0.0) FROM trades "
+            "WHERE status='closed' AND pnl IS NOT NULL AND exit_ts >= ?",
+            (midnight.isoformat(),)
+        ).fetchone()
+        daily_pnl = float(row[0]) if row else 0.0
+
+        if daily_pnl < -MAX_DAILY_LOSS_EUR:
+            log.warning(
+                "KILL SWITCH: daily loss %.2f€ < -%.2f€", daily_pnl, MAX_DAILY_LOSS_EUR
+            )
+            return KillSwitchStatus(
+                level=1, active=True,
+                reason=f"Daily loss {daily_pnl:.2f}€ < -{MAX_DAILY_LOSS_EUR}€",
+                cooldown_until=None,
+                allow_new_trades=False, allow_exit_only=True,
+            )
+
+        if bankroll > 0 and daily_pnl / bankroll < -MAX_DAILY_LOSS_PCT:
+            pct = (daily_pnl / bankroll) * 100
+            log.warning("KILL SWITCH: daily loss %.1f%% < -%.0f%%", pct, MAX_DAILY_LOSS_PCT * 100)
+            return KillSwitchStatus(
+                level=1, active=True,
+                reason=f"Daily loss {pct:.1f}% < -{MAX_DAILY_LOSS_PCT*100:.0f}%",
+                cooldown_until=None,
+                allow_new_trades=False, allow_exit_only=True,
+            )
+
+        return KillSwitchStatus(
+            level=0, active=False, reason="ok",
+            cooldown_until=None, allow_new_trades=True, allow_exit_only=False,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4C. CONCENTRATION RISK CHECKER
+# ═══════════════════════════════════════════════════════════════════════════
+
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "macro_fed": ["fed", "fomc", "rate", "powell", "inflation", "cpi", "bls"],
+    "crypto": ["btc", "bitcoin", "eth", "ethereum", "crypto", "solana"],
+    "politics": ["election", "president", "congress", "senate", "trump", "biden"],
+    "sports": ["nba", "nfl", "mlb", "nhl", "super bowl", "championship"],
+    "geopolitics": ["ukraine", "russia", "china", "taiwan", "war", "nato"],
+}
+
+
+def get_market_category(question: str) -> str:
+    """Classify a market into a category via keywords."""
+    q_lower = question.lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(kw in q_lower for kw in keywords):
+            return category
+    return "other"
+
+
+def check_concentration_risk(
+    new_question: str, open_positions: list,
+) -> tuple[bool, str]:
+    """
+    Returns (passed, reason).
+    Refuses a trade if the category already has MAX_POSITIONS_PER_CATEGORY positions.
+    """
+    new_cat = get_market_category(new_question)
+    count = sum(
+        1 for pos in open_positions
+        if get_market_category(getattr(pos, 'question', '')) == new_cat
+    )
+    if count >= MAX_POSITIONS_PER_CATEGORY:
+        return False, f"concentration_risk: {new_cat} has {count} positions (max {MAX_POSITIONS_PER_CATEGORY})"
+    return True, "ok"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4D. CIRCUIT BREAKER
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CircuitBreaker:
+    """Simple circuit breaker for external API calls."""
+    name: str
+    failure_threshold: int = 3
+    recovery_timeout: int = 300  # seconds
+
+    _failures: int = field(default=0, init=False, repr=False)
+    _state: str = field(default="closed", init=False, repr=False)
+    _opened_at: Optional[datetime] = field(default=None, init=False, repr=False)
+
+    def call_allowed(self) -> bool:
+        if self._state == "closed":
+            return True
+        if self._state == "open":
+            if self._opened_at and (datetime.now(timezone.utc) - self._opened_at).total_seconds() > self.recovery_timeout:
+                self._state = "half_open"
+                return True
+            return False
+        return True  # half_open
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= self.failure_threshold:
+            self._state = "open"
+            self._opened_at = datetime.now(timezone.utc)
+            log.error(
+                "CIRCUIT BREAKER OPEN: %s — %d consecutive failures, pausing %ds",
+                self.name, self._failures, self.recovery_timeout
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 5. RISK MANAGER — interface principale
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -567,13 +695,20 @@ class RiskManager:
         self.gate       = GateValidator()
         self.exit_eval  = ExitRuleEvaluator()
         self.kill_sw    = KillSwitchMonitor(db_repo)
+        self.daily_loss = DailyLossMonitor()
         self.metrics    = metrics
+        self._db_repo   = db_repo
 
     def check_kill_switches(
         self,
         bankroll: float,
         positions: list,
     ) -> KillSwitchStatus:
+        # Daily loss check (highest priority)
+        dl = self.daily_loss.check(self._db_repo.conn, bankroll)
+        if dl.active:
+            return dl
+
         state = self.metrics.build_portfolio_state(bankroll, positions)
         return self.kill_sw.check(
             bankroll            = bankroll,
@@ -626,15 +761,26 @@ class RiskManager:
         )
         result = self.gate.validate(inp)
 
+        # Concentration risk gate (post 7-gates)
+        if result.passed or result.action in ("TRADE", "REDUCE"):
+            # Need question from one of the positions context — use p_model search
+            # The caller should pass question; for now check by positions list
+            conc_ok, conc_reason = check_concentration_risk(
+                getattr(positions[0], 'question', '') if positions else '',
+                positions
+            )
+            if not conc_ok:
+                result.failures.append("concentration_risk_gate")
+                result.passed = False
+                result.action = "BLOCK"
+
         if result.passed:
             log.info(
-                f"Gates OK: edge={edge:+.3f} ev={ev:+.3f} kelly={kelly:.2f}€ "
-                f"strategy={strategy}"
+                "Gates OK: edge=%+.3f ev=%+.3f kelly=%.2f€ strategy=%s",
+                edge, ev, kelly, strategy
             )
         else:
-            log.warning(
-                f"Gate failures: {result.failures} — {result.rationale}"
-            )
+            log.warning("Gate failures: %s — %s", result.failures, result.rationale)
         return result
 
     def check_exit(

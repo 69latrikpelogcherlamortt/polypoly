@@ -81,7 +81,7 @@ class MarketScanner:
                 if len(batch) < batch_limit:
                     break
 
-                time.sleep(0.5)
+                time.sleep(0.5)  # Sync rate limiting — scanner is called from async via await
 
             except requests.RequestException as e:
                 log.error(f"Gamma API error: {e}")

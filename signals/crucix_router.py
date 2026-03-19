@@ -55,11 +55,7 @@ from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("crucix.router")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+# NOTE: logging configuration is handled exclusively by main.py setup_logging()
 
 DB_PATH = Path("paf_signals.db")
 

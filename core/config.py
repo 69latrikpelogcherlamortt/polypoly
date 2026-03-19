@@ -172,6 +172,13 @@ PROFIT_FACTOR_MIN       = 1.2             # recalibration si PF < 1.2 sur 50 tra
 COOLDOWN_HOURS_MDD      = 72              # cooldown après MDD gate
 COOLDOWN_HOURS_LOSSES   = 48              # cooldown après 5 pertes consécutives
 
+# Daily loss limits
+MAX_DAILY_LOSS_EUR      = 15.0            # arrêt si perte > 15€ en un jour
+MAX_DAILY_LOSS_PCT      = 0.15            # arrêt si perte > 15% du bankroll en un jour
+
+# Concentration risk
+MAX_POSITIONS_PER_CATEGORY = 3            # max positions dans une même catégorie
+
 # Sortie anticipée
 EXIT_EDGE_MIN           = 0.04            # sortir si edge < 4¢
 EXIT_PROFIT_CAPTURE_PCT = 0.65            # sortir si 65% du potentiel capturé
