@@ -1,12 +1,11 @@
 # Polymarket Trading Bot — PAF-001
 # Python 3.10+
-# Installez avec : python -m pip install -r requirements.txt
+# For deterministic installs: pip install -r requirements.txt
 
 # ── Polymarket CLOB ──────────────────────────────────────────────────────────
 py-clob-client>=0.34.6
 
 # ── HTTP / WebSocket ─────────────────────────────────────────────────────────
-requests>=2.32.0
 aiohttp>=3.9.0
 websockets>=12.0
 httpx[http2]>=0.27.0     # requis par py-clob-client (HTTP/2)
@@ -17,21 +16,21 @@ scipy>=1.12.0
 scikit-learn>=1.4.0
 pandas>=2.2.0
 
-# ── NLP — Reference Class Engine ─────────────────────────────────────────────
+# ── NLP — Reference Class Engine (optionnel, fallback keyword si absent) ────
 sentence-transformers>=2.7.0
-torch>=2.0.0              # requis par sentence-transformers
+torch>=2.0.0
 
-# ── SSL ────────────────────────────────────────────────────────────────────--
-certifi>=2024.2.2         # certificats CA à jour (corrige SSL_CERT_FILE manquant)
+# ── SSL ──────────────────────────────────────────────────────────────────────
+certifi>=2024.2.2
 
-# ── RSS / Web scraping ───────────────────────────────────────────────────────
-feedparser>=6.0.11
+# ── XML parsing ──────────────────────────────────────────────────────────────
 lxml>=5.1.0
 
 # ── Config ───────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 
-# ── Async ────────────────────────────────────────────────────────────────────
-asyncio-throttle>=1.0.2
+# ── Dev / Test (install with: pip install -r requirements-dev.txt) ───────────
+# pytest, pytest-cov, pytest-asyncio, ruff, mypy, bandit, pip-audit
 
-# ── SQLite est inclus dans Python stdlib — pas d'install nécessaire ──────────
+# ── REMOVED: requests (replaced by aiohttp), feedparser (unused),
+#    asyncio-throttle (unused)
