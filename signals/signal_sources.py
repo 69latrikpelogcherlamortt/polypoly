@@ -26,7 +26,6 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 import aiohttp
-import requests
 
 from core.config import (
     DERIBIT_BASE, REUTERS_FEEDS, AP_FEEDS, GOOGLE_NEWS_BASE,
@@ -87,16 +86,18 @@ class CMEFedWatchSource:
     # Endpoint alternatif (API JSON non-officielle mais stable)
     FEDWATCH_DATA_URL = "https://www.cmegroup.com/CmeWS/mvc/GetFedWatch/ProbHistoricalData"
 
-    def fetch(self) -> list[CrucixAlert]:
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         alerts = []
         try:
-            resp = requests.get(
+            async with session.get(
                 self.FEDWATCH_DATA_URL,
-                timeout=15,
                 headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
         except Exception as e:
             log.warning(f"CME FedWatch fetch failed: {e}")
             return alerts
@@ -162,54 +163,63 @@ class DeribitSource:
     BTC_STRIKES = [100_000, 120_000, 150_000, 200_000]
     ETH_STRIKES = [5_000, 8_000, 10_000]
 
-    def _get_instruments(self, currency: str) -> list[dict]:
+    async def _get_instruments(self, session: aiohttp.ClientSession, currency: str) -> list[dict]:
         try:
-            resp = requests.get(
+            async with session.get(
                 f"{DERIBIT_BASE}/get_instruments",
                 params={
                     "currency": currency,
                     "kind": "option",
                     "expired": "false",
                 },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("result", [])
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+                return data.get("result", [])
         except Exception as e:
             log.warning(f"Deribit instruments ({currency}): {e}")
             return []
 
-    def _get_ticker(self, instrument: str) -> Optional[dict]:
+    async def _get_ticker(self, session: aiohttp.ClientSession, instrument: str) -> Optional[dict]:
         try:
-            resp = requests.get(
+            async with session.get(
                 f"{DERIBIT_BASE}/ticker",
                 params={"instrument_name": instrument},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("result")
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return None
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+                return data.get("result")
         except Exception:
             return None
 
-    def _get_btc_price(self) -> Optional[float]:
+    async def _get_btc_price(self, session: aiohttp.ClientSession) -> Optional[float]:
         try:
-            resp = requests.get(
+            async with session.get(
                 f"{DERIBIT_BASE}/get_index_price",
                 params={"index_name": "btc_usd"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            return resp.json().get("result", {}).get("index_price")
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return None
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+                return data.get("result", {}).get("index_price")
         except Exception:
             return None
 
-    def fetch(self) -> list[CrucixAlert]:
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         alerts = []
-        btc_price = self._get_btc_price()
+        btc_price = await self._get_btc_price(session)
         if btc_price is None:
             return alerts
 
-        instruments = self._get_instruments("BTC")
+        instruments = await self._get_instruments(session, "BTC")
         # Filtrer calls seulement, expirant dans 30-400 jours
         now = datetime.now(timezone.utc)
         calls = [
@@ -230,7 +240,7 @@ class DeribitSource:
                 continue
 
             instrument_name = matches[0]["instrument_name"]
-            ticker = self._get_ticker(instrument_name)
+            ticker = await self._get_ticker(session, instrument_name)
             if not ticker:
                 continue
 
@@ -296,18 +306,22 @@ class RSSNewsSource:
         "election", "geopolitical", "war", "sanctions",
     }
 
-    def fetch_rss(self, url: str, source_id: str,
-                  category: AlertCategory) -> list[CrucixAlert]:
+    async def fetch_rss(self, session: aiohttp.ClientSession, url: str,
+                        source_id: str,
+                        category: AlertCategory) -> list[CrucixAlert]:
         alerts = []
         try:
-            resp = requests.get(
+            async with session.get(
                 url,
-                timeout=10,
                 headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                raw_bytes = await resp.read()
             try:
-                root = ET.fromstring(resp.content)
+                root = ET.fromstring(raw_bytes)
             except ET.ParseError as e:
                 log.warning(f"RSS XML parse error {url}: {e}")
                 return alerts
@@ -358,25 +372,25 @@ class RSSNewsSource:
 
         return alerts
 
-    def fetch_reuters(self) -> list[CrucixAlert]:
+    async def fetch_reuters(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         alerts = []
         for url in REUTERS_FEEDS:
             alerts.extend(
-                self.fetch_rss(url, "reuters_rss", AlertCategory.NEWS_TIER1)
+                await self.fetch_rss(session, url, "reuters_rss", AlertCategory.NEWS_TIER1)
             )
         return alerts
 
-    def fetch_ap(self) -> list[CrucixAlert]:
+    async def fetch_ap(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         alerts = []
         for url in AP_FEEDS:
             alerts.extend(
-                self.fetch_rss(url, "ap_news", AlertCategory.NEWS_TIER1)
+                await self.fetch_rss(session, url, "ap_news", AlertCategory.NEWS_TIER1)
             )
         return alerts
 
-    def fetch_fed_gov(self) -> list[CrucixAlert]:
-        return self.fetch_rss(
-            FED_PRESS_RSS, "fed_gov_statement", AlertCategory.FED_MACRO
+    async def fetch_fed_gov(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
+        return await self.fetch_rss(
+            session, FED_PRESS_RSS, "fed_gov_statement", AlertCategory.FED_MACRO
         )
 
     @staticmethod
@@ -413,20 +427,24 @@ class GoogleNewsSource:
     Utilisé au moment du scoring d'un marché candidat.
     """
 
-    def fetch_for_market(self, question: str, max_items: int = 5) -> list[CrucixAlert]:
+    async def fetch_for_market(self, session: aiohttp.ClientSession,
+                               question: str, max_items: int = 5) -> list[CrucixAlert]:
         keyword = quote_plus(question[:80])
         url = f"{GOOGLE_NEWS_BASE}?q={keyword}&hl=en&gl=US"
 
         alerts = []
         try:
-            resp = requests.get(
+            async with session.get(
                 url,
-                timeout=10,
                 headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                raw_bytes = await resp.read()
             try:
-                root = ET.fromstring(resp.content)
+                root = ET.fromstring(raw_bytes)
             except ET.ParseError as e:
                 log.debug(f"Google News XML parse error ({question[:40]}...): {e}")
                 return alerts
@@ -465,24 +483,28 @@ class KalshiSource:
     Divergence > 5% → signal fort.
     """
 
-    def _search_market(self, keyword: str) -> Optional[dict]:
+    async def _search_market(self, session: aiohttp.ClientSession,
+                             keyword: str) -> Optional[dict]:
         try:
-            resp = requests.get(
+            async with session.get(
                 KALSHI_API,
                 params={"search": keyword, "limit": 5, "status": "open"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            markets = data.get("markets", [])
-            if markets:
-                return markets[0]
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return None
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+                markets = data.get("markets", [])
+                if markets:
+                    return markets[0]
         except Exception as e:
             log.debug(f"Kalshi search ({keyword}): {e}")
         return None
 
-    def check_divergence(
+    async def check_divergence(
         self,
+        session: aiohttp.ClientSession,
         poly_price: float,
         market_question: str,
         keywords: list[str],
@@ -491,7 +513,7 @@ class KalshiSource:
         Retourne une alerte si Kalshi diverge de >5% de Polymarket.
         """
         keyword = " ".join(keywords[:3])
-        k_market = self._search_market(keyword)
+        k_market = await self._search_market(session, keyword)
         if not k_market:
             return None
 
@@ -544,20 +566,23 @@ class PolymarketActivitySource:
     Détecte les volume spikes et les mouvements de wallet de référence.
     """
 
-    def check_volume_spike(
-        self, market_id: str, expected_daily_vol: float
+    async def check_volume_spike(
+        self, session: aiohttp.ClientSession,
+        market_id: str, expected_daily_vol: float
     ) -> Optional[CrucixAlert]:
         """
         Volume spike = volume dernières 2h > 15% du volume journalier attendu.
         """
         try:
-            resp = requests.get(
+            async with session.get(
                 f"{POLY_ACTIVITY}",
                 params={"market": market_id, "limit": 50},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            trades = resp.json()
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return None
+                resp.raise_for_status()
+                trades = await resp.json(content_type=None)
         except Exception as e:
             log.debug(f"Poly activity ({market_id}): {e}")
             return None
@@ -593,7 +618,8 @@ class PolymarketActivitySource:
             entities={"vol_2h": vol_2h, "expected_daily": expected_daily_vol},
         )
 
-    def check_whale_wallet(self, wallet_address: str) -> list[CrucixAlert]:
+    async def check_whale_wallet(self, session: aiohttp.ClientSession,
+                                 wallet_address: str) -> list[CrucixAlert]:
         """
         Surveille les trades récents d'un wallet de référence.
         """
@@ -601,13 +627,15 @@ class PolymarketActivitySource:
             return []
         alerts = []
         try:
-            resp = requests.get(
+            async with session.get(
                 POLY_ACTIVITY,
                 params={"user": wallet_address, "type": "TRADE", "limit": 10},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            trades = resp.json()
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                trades = await resp.json(content_type=None)
         except Exception as e:
             log.debug(f"Whale wallet ({wallet_address[:10]}...): {e}")
             return []
@@ -731,18 +759,22 @@ class NitterSource:
     Filtre strict : comptes haute valeur uniquement.
     """
 
-    def _fetch_user_feed(self, username: str) -> list[dict]:
+    async def _fetch_user_feed(self, session: aiohttp.ClientSession,
+                               username: str) -> list[dict]:
         for instance in NITTER_INSTANCES:
             url = f"{instance}/{username}/rss"
             try:
-                resp = requests.get(
+                async with session.get(
                     url,
-                    timeout=8,
                     headers={"User-Agent": "Mozilla/5.0"},
-                )
-                resp.raise_for_status()
+                ) as resp:
+                    if resp.status == 429:
+                        log.warning("%s rate limited", self.__class__.__name__)
+                        return []
+                    resp.raise_for_status()
+                    raw_bytes = await resp.read()
                 try:
-                    root = ET.fromstring(resp.content)
+                    root = ET.fromstring(raw_bytes)
                 except ET.ParseError:
                     continue
                 items = root.findall(".//item")
@@ -768,7 +800,7 @@ class NitterSource:
                 return False
         return True
 
-    def fetch(self) -> list[CrucixAlert]:
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         alerts = []
         all_accounts = (
             TWITTER_ACCOUNTS_TIER1
@@ -778,7 +810,7 @@ class NitterSource:
         rss = RSSNewsSource()
 
         for username in all_accounts:
-            tweets = self._fetch_user_feed(username)
+            tweets = await self._fetch_user_feed(session, username)
             for tweet in tweets:
                 if not self._filter_tweet(tweet):
                     continue
@@ -842,7 +874,7 @@ class BLSSource:
         """Retourne les données macro les plus récentes (dict vide si pas encore fetchées)."""
         return dict(self._macro_cache)
 
-    def fetch(self) -> list[CrucixAlert]:
+    async def fetch(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         if not BLS_API_KEY:
             log.debug("BLS_API_KEY non configurée, skip BLS")
             return []
@@ -855,9 +887,12 @@ class BLSSource:
                 "endyear": str(datetime.now().year),
                 "registrationkey": BLS_API_KEY,
             }
-            resp = requests.post(BLS_API_BASE, json=payload, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            async with session.post(BLS_API_BASE, json=payload) as resp:
+                if resp.status == 429:
+                    log.warning("%s rate limited", self.__class__.__name__)
+                    return []
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
         except Exception as e:
             log.warning(f"BLS fetch error: {e}")
             return []
@@ -916,7 +951,8 @@ class SignalAggregator:
     Appelé par le main loop à chaque cycle (toutes les 10 minutes).
     """
 
-    def __init__(self):
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session     = session
         self.cme         = CMEFedWatchSource()
         self.deribit     = DeribitSource()
         self.rss         = RSSNewsSource()
@@ -943,7 +979,7 @@ class SignalAggregator:
     def _mark_fetched(self, source: str):
         self._last_fetch[source] = datetime.now(timezone.utc)
 
-    def collect_all(
+    async def collect_all(
         self,
         open_positions: Optional[list] = None,
         market_candidates: Optional[list] = None,
@@ -957,53 +993,53 @@ class SignalAggregator:
         # CME FedWatch — toutes les heures
         if self._should_fetch("cme", 3600):
             try:
-                new = self.cme.fetch()
+                new = await self.cme.fetch(self.session)
                 alerts.extend(new)
                 log.info(f"CME FedWatch: {len(new)} alertes")
                 self._mark_fetched("cme")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"CME error: {e}")
 
         # Deribit — toutes les 15 minutes
         if self._should_fetch("deribit", 900):
             try:
-                new = self.deribit.fetch()
+                new = await self.deribit.fetch(self.session)
                 alerts.extend(new)
                 log.info(f"Deribit: {len(new)} alertes")
                 self._mark_fetched("deribit")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"Deribit error: {e}")
 
         # Reuters + AP — toutes les 5 minutes
         if self._should_fetch("rss", 300):
             try:
-                r_alerts = self.rss.fetch_reuters()
-                a_alerts = self.rss.fetch_ap()
-                f_alerts = self.rss.fetch_fed_gov()
+                r_alerts = await self.rss.fetch_reuters(self.session)
+                a_alerts = await self.rss.fetch_ap(self.session)
+                f_alerts = await self.rss.fetch_fed_gov(self.session)
                 alerts.extend(r_alerts + a_alerts + f_alerts)
                 log.info(f"RSS: {len(r_alerts)+len(a_alerts)+len(f_alerts)} alertes")
                 self._mark_fetched("rss")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"RSS error: {e}")
 
         # Twitter/Nitter — toutes les 10 minutes
         if self._should_fetch("nitter", 600):
             try:
-                new = self.nitter.fetch()
+                new = await self.nitter.fetch(self.session)
                 alerts.extend(new)
                 log.info(f"Nitter: {len(new)} alertes")
                 self._mark_fetched("nitter")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"Nitter error: {e}")
 
         # BLS — toutes les 6 heures
         if self._should_fetch("bls", 21600):
             try:
-                new = self.bls.fetch()
+                new = await self.bls.fetch(self.session)
                 alerts.extend(new)
                 log.info(f"BLS: {len(new)} alertes")
                 self._mark_fetched("bls")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"BLS error: {e}")
 
         # BTC momentum (Binance)
@@ -1014,18 +1050,18 @@ class SignalAggregator:
         # Whale wallet — toutes les 10 minutes
         if self._should_fetch("whale", 600) and REFERENCE_WALLET:
             try:
-                new = self.poly_act.check_whale_wallet(REFERENCE_WALLET)
+                new = await self.poly_act.check_whale_wallet(self.session, REFERENCE_WALLET)
                 alerts.extend(new)
                 log.info(f"Whale: {len(new)} alertes")
                 self._mark_fetched("whale")
-            except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"Whale error: {e}")
 
         log.info(f"Signal cycle total: {len(alerts)} alertes collectées")
         return alerts
 
-    def collect_for_market(self, question: str, price: float,
-                            keywords: list[str]) -> list[CrucixAlert]:
+    async def collect_for_market(self, question: str, price: float,
+                                 keywords: list[str]) -> list[CrucixAlert]:
         """
         Collecte les signaux spécifiques pour un marché candidat
         (appelé lors du scoring initial).
@@ -1034,13 +1070,13 @@ class SignalAggregator:
 
         # Google News
         try:
-            alerts.extend(self.google.fetch_for_market(question))
+            alerts.extend(await self.google.fetch_for_market(self.session, question))
         except Exception as e:
             log.debug(f"Google News for market: {e}")
 
         # Kalshi cross-check
         try:
-            k_alert = self.kalshi.check_divergence(price, question, keywords)
+            k_alert = await self.kalshi.check_divergence(self.session, price, question, keywords)
             if k_alert:
                 alerts.append(k_alert)
         except Exception as e:

@@ -243,11 +243,13 @@ class TradingBot:
     Orchestrateur principal du bot PAF-001.
     """
 
-    def __init__(self):
+    def __init__(self, http_session: Optional[aiohttp.ClientSession] = None):
         log.info("=" * 60)
         log.info("  PAF-001 TRADING BOT — Démarrage")
-        log.info(f"  Mode: {'PAPER TRADING (DRY RUN)' if DRY_RUN else '⚠  LIVE TRADING'}")
+        log.info("  Mode: %s", 'PAPER TRADING (DRY RUN)' if DRY_RUN else '⚠  LIVE TRADING')
         log.info("=" * 60)
+
+        self.http_session = http_session
 
         # ── Persistance ───────────────────────────────────────────────────
         self.trading_conn  = init_trading_db(DB_PATH)
@@ -257,8 +259,8 @@ class TradingBot:
         # ── Modèles ───────────────────────────────────────────────────────
         self.hist_db       = HistoricalDB(DB_PATH)
         self.scorer        = ProbabilisticScorer(self.trading_conn, self.hist_db)
-        self.scanner       = MarketScanner()
-        self.signals       = SignalAggregator()
+        self.scanner       = MarketScanner(session=http_session)
+        self.signals       = SignalAggregator(session=http_session)
         self.risk          = RiskManager(self.trade_repo, self.metrics)
 
         # ── Signal router ─────────────────────────────────────────────────
@@ -330,7 +332,7 @@ class TradingBot:
             return
 
         # ── Collecter signaux ─────────────────────────────────────────────
-        alerts = self.signals.collect_all(
+        alerts = await self.signals.collect_all(
             open_positions  = positions,
             market_candidates = self.candidates,
         )
@@ -421,7 +423,7 @@ class TradingBot:
         self._last_scan = now
 
         try:
-            self.candidates = self.scanner.get_candidates()
+            self.candidates = await self.scanner.get_candidates()
         except Exception as e:
             log.error(f"Market scan error: {e}")
             return
@@ -461,7 +463,7 @@ class TradingBot:
         log.debug(f"Évaluation: {question[:50]}... (S={strategy})")
 
         # Collecter signaux contextuels
-        context_alerts = self.signals.collect_for_market(
+        context_alerts = await self.signals.collect_for_market(
             question = question,
             price    = price,
             keywords = question.lower().split()[:8],
@@ -702,18 +704,18 @@ class TradingBot:
     async def _check_position(self, pos: OpenPosition):
         """Vérifie l'état d'une position."""
         # Vérifier résolution
-        is_resolved, outcome = self.scanner.is_market_resolved(pos.market_id)
+        is_resolved, outcome = await self.scanner.is_market_resolved(pos.market_id)
 
         if is_resolved and outcome is not None:
             await self._close_position_resolved(pos, outcome)
             return
 
         # Mettre à jour le prix actuel
-        current_price = self.scanner.get_market_price(pos.market_id)
+        current_price = await self.scanner.get_market_price(pos.market_id)
         if current_price is None:
             return
 
-        current_days = self.scanner.get_current_days(pos.market_id)
+        current_days = await self.scanner.get_current_days(pos.market_id)
         days = current_days or pos.days_to_res
 
         self.trade_repo.update_position_price(
@@ -1020,15 +1022,28 @@ class TradingBot:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def main():
-    bot = TradingBot()
-    try:
-        await bot.run()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Interruption reçue. Arrêt propre.")
-        await bot._graceful_shutdown()
-    finally:
-        bot.signals.btc_tracker.stop()
-        log.info("Bot process exiting.")
+    import aiohttp as _aiohttp
+    connector = _aiohttp.TCPConnector(
+        limit=20,
+        limit_per_host=4,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    timeout = _aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    async with _aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers={"User-Agent": "PAF-001-TradingBot/1.0"},
+    ) as http_session:
+        bot = TradingBot(http_session=http_session)
+        try:
+            await bot.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            log.info("Interruption reçue. Arrêt propre.")
+            await bot._graceful_shutdown()
+        finally:
+            bot.signals.btc_tracker.stop()
+            log.info("Bot process exiting.")
 
 
 if __name__ == "__main__":
