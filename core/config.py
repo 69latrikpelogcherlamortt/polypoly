@@ -190,22 +190,21 @@ EXIT_PROFIT_CAPTURE_PCT = 0.65            # sortir si 65% du potentiel capturé
 EXIT_ADVERSE_MOVE_PCT   = 0.30            # sortir si marché bouge >30% contre
 
 # Stratégie 1 filtres
-# 2026 : les marchés Polymarket viables ont au minimum ~50k$/jour de volume.
-# Plafond relevé à 1M$/jour — au-delà le modèle n'a plus d'avantage structurel.
-S1_VOL_MIN  = 50_000
-S1_VOL_MAX  = 1_000_000
-S1_DAYS_MIN = 5
-S1_DAYS_MAX = 21
-S1_PRICE_FAV_MIN  = 0.70
-S1_PRICE_FAV_MAX  = 0.92
+# vol24 = volume 24h du marché. En 2026 les marchés viables font 10k-500k$/jour.
+# Le seuil de 50k ne s'applique qu'au volume TOTAL (market_efficiency_score).
+S1_VOL_MIN  = 10_000        # 10k$/24h minimum pour avoir de la liquidité
+S1_VOL_MAX  = 1_000_000     # plafond large — market_efficiency_score filtre au-dessus
+S1_DAYS_MIN = 3
+S1_DAYS_MAX = 30
+S1_PRICE_FAV_MIN  = 0.60
+S1_PRICE_FAV_MAX  = 0.93
 S1_PRICE_LONG_MIN = 0.01
-S1_PRICE_LONG_MAX = 0.10
+S1_PRICE_LONG_MAX = 0.12
 
 # Stratégie 2 filtres
-# Seuil minimum aligné sur la réalité 2026
-S2_VOL_MIN   = 50_000
-S2_DAYS_MIN  = 14
-S2_DAYS_MAX  = 90
+S2_VOL_MIN   = 10_000
+S2_DAYS_MIN  = 7
+S2_DAYS_MAX  = 120
 S2_PRICE_MIN = 0.01
 S2_PRICE_MAX = 0.08
 S2_EDGE_RATIO_MIN  = 2.0
