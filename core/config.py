@@ -189,28 +189,32 @@ EXIT_EDGE_MIN           = 0.04            # sortir si edge < 4¢
 EXIT_PROFIT_CAPTURE_PCT = 0.65            # sortir si 65% du potentiel capturé
 EXIT_ADVERSE_MOVE_PCT   = 0.30            # sortir si marché bouge >30% contre
 
-# Stratégie 1 filtres
-# vol24 = volume 24h du marché. En 2026 les marchés viables font 10k-500k$/jour.
-# Le seuil de 50k ne s'applique qu'au volume TOTAL (market_efficiency_score).
-S1_VOL_MIN  = 10_000        # 10k$/24h minimum pour avoir de la liquidité
-S1_VOL_MAX  = 1_000_000     # plafond large — market_efficiency_score filtre au-dessus
-S1_DAYS_MIN = 3
-S1_DAYS_MAX = 30
-S1_PRICE_FAV_MIN  = 0.60
-S1_PRICE_FAV_MAX  = 0.93
-S1_PRICE_LONG_MIN = 0.01
-S1_PRICE_LONG_MAX = 0.12
+# Stratégie 1 filtres — calibration 2026
+# En 2026 les marchés les plus liquides ont des prix extrêmes (>0.93 ou <0.07).
+# Le scanner doit être un filtre LARGE ; c'est le prob_model qui décide de l'edge.
+# On capture :
+#   - Favoris classiques      : 0.55-0.93 (incertitude modérée)
+#   - NO-longhots             : YES 0.88-0.97 → le côté NO (3-12%) est mispriced
+#   - YES-longhots            : 0.03-0.15
+S1_VOL_MIN  = 10_000        # 10k$/24h minimum de liquidité
+S1_VOL_MAX  = 50_000_000    # pas de plafond — market_efficiency_score filtre
+S1_DAYS_MIN = 1
+S1_DAYS_MAX = 90            # horizons longs inclus (2026 = marchés pluriannuels)
+S1_PRICE_FAV_MIN  = 0.55    # favori : doute raisonnable
+S1_PRICE_FAV_MAX  = 0.97    # inclut les marchés quasi-certains (edge sur NO side)
+S1_PRICE_LONG_MIN = 0.03    # longshot YES
+S1_PRICE_LONG_MAX = 0.15
 
-# Stratégie 2 filtres
+# Stratégie 2 filtres — longhots macro/crypto
 S2_VOL_MIN   = 10_000
-S2_DAYS_MIN  = 7
-S2_DAYS_MAX  = 120
-S2_PRICE_MIN = 0.01
-S2_PRICE_MAX = 0.08
+S2_DAYS_MIN  = 3
+S2_DAYS_MAX  = 365           # crypto/macro = marchés longs
+S2_PRICE_MIN = 0.02
+S2_PRICE_MAX = 0.15          # longhots crypto peuvent aller jusqu'à 15%
 S2_EDGE_RATIO_MIN  = 2.0
 S2_EDGE_ABS_MIN    = 0.06
 
-S2_CATEGORIES = {"crypto", "economics", "politics", "finance", "sports"}
+S2_CATEGORIES = {"crypto", "economics", "politics", "finance", "sports", "tech"}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. POLLING INTERVALS (secondes)
