@@ -167,6 +167,7 @@ class MarketScanner:
             price = self.parse_yes_price(m)
             days = self.days_to_resolution(m)
             vol24 = float(m.get("volume24hr", 0) or 0)
+            vol_total = float(m.get("volume", 0) or 0)  # volume cumulé depuis création
 
             if price is None or days is None:
                 skipped_reasons["missing_price_days"] = skipped_reasons.get("missing_price_days", 0) + 1
@@ -185,6 +186,7 @@ class MarketScanner:
                 "question": m.get("question"),
                 "price": price,
                 "volume_24h": vol24,
+                "volume_total": vol_total,
                 "liquidity": float(m.get("liquidity", 0) or 0),
                 "days_to_res": days,
                 "category": m.get("category", "").lower(),

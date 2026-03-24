@@ -768,30 +768,34 @@ def market_efficiency_score(volume_total: float, volume_24h: float,
                              days_to_res: float, n_traders: int = 0) -> dict:
     """
     Évalue l'efficience du marché pour décider si l'edge du modèle est exploitable.
+    Calibration 2026 — Polymarket est devenu un marché majeur à plusieurs milliards.
 
     Principe : la sagesse des foules nécessite une vraie foule.
-    - Volume total < 5k$  → marché mort, spread trop large
-    - Volume total 5-50k$ → marché fin, modèle a un avantage
-    - Volume 50-200k$     → marché semi-efficient, edge marginal
-    - Volume > 200k$      → marché efficient, modèle n'a pas d'avantage structurel
+    En 2026, les marchés en dessous de 500k$ total n'ont plus de liquidité exploitable.
+
+    - Volume total < 500k$    → mort  : spread trop large, aucun teneur de marché
+    - Volume total 500k-5M$   → fin   : crowd wisdom faible, modèle a un avantage réel
+    - Volume 5M-20M$          → semi  : crowd partiel, edge marginal mais possible
+    - Volume 20M-100M$        → semi_efficient : très compétitif, edge rare
+    - Volume > 100M$          → efficient : market-makers pro, inutile de trader
 
     Retourne :
       score       : 0.0 (très efficient) → 1.0 (très inefficient, exploitable)
-      tier        : "dead" | "thin" | "semi" | "efficient"
+      tier        : "dead" | "thin" | "semi" | "semi_efficient" | "efficient"
       tradeable   : bool (recommandation)
     """
     vol = max(0.0, volume_total)
 
-    if vol < 2_000:
-        return {"score": 0.0, "tier": "dead",      "tradeable": False,
-                "reason": "volume_trop_faible"}
-    elif vol < 15_000:
+    if vol < 500_000:
+        return {"score": 0.0, "tier": "dead",           "tradeable": False,
+                "reason": "volume_trop_faible_2026"}
+    elif vol < 5_000_000:
         score = 0.85
         tier  = "thin"
-    elif vol < 50_000:
+    elif vol < 20_000_000:
         score = 0.65
         tier  = "semi"
-    elif vol < 200_000:
+    elif vol < 100_000_000:
         score = 0.35
         tier  = "semi_efficient"
     else:
@@ -802,8 +806,8 @@ def market_efficiency_score(volume_total: float, volume_24h: float,
     if 1 <= days_to_res <= 7:
         score = min(1.0, score + 0.15)
 
-    # Pénalité : si volume_24h très bas, marché en train de mourir
-    if volume_24h < 100 and vol < 20_000:
+    # Pénalité : si volume_24h très bas par rapport à la taille du marché → liquidité morte
+    if volume_24h < 10_000 and vol < 2_000_000:
         score = max(0.0, score - 0.20)
 
     tradeable = score >= 0.35 and tier != "efficient"
@@ -991,6 +995,7 @@ class ScoringContext:
     days_to_res:    float
     category:       str
     volume_24h:     float
+    volume_total:   float = 0.0  # volume cumulé depuis création (champ "volume" API Gamma)
     # Données quantitatives optionnelles
     btc_spot:       Optional[float] = None
     btc_target:     Optional[float] = None
@@ -1202,8 +1207,11 @@ class ProbabilisticScorer:
         edge = edge_calibrated
 
         # Efficience du marché
+        # Utilise le volume total réel de l'API Gamma si disponible,
+        # sinon fallback sur vol24 * 30 (estimation mois glissant) pour 2026.
+        vol_total_real = ctx.volume_total if ctx.volume_total > 0 else ctx.volume_24h * 30
         eff = market_efficiency_score(
-            volume_total  = ctx.volume_24h * 7,   # estimation volume total ~7j
+            volume_total  = vol_total_real,
             volume_24h    = ctx.volume_24h,
             days_to_res   = ctx.days_to_res,
         )

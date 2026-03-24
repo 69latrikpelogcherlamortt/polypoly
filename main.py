@@ -461,6 +461,7 @@ class TradingBot:
         days       = candidate.get("days_to_res", 14.0)
         category   = candidate.get("category", "")
         vol24      = candidate.get("volume_24h", 0.0)
+        vol_total  = candidate.get("volume_total", 0.0)
         is_longshot= candidate.get("is_longshot", False)
 
         log.debug(f"Évaluation: {question[:50]}... (S={strategy})")
@@ -498,6 +499,7 @@ class TradingBot:
             days_to_res  = days,
             category     = category,
             volume_24h   = vol24,
+            volume_total = vol_total,
             btc_spot     = btc_spot,
             btc_target   = btc_target,
             btc_sigma    = 0.80,  # vol BTC par défaut
