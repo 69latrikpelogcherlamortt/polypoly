@@ -576,7 +576,7 @@ class BrierWeightedEnsemble:
 
     def __init__(self, db_conn: sqlite3.Connection):
         self.conn   = db_conn
-        self.models = ["base_rate", "quant", "bayes_updated"]
+        self.models = ["base_rate", "quant", "bayes_updated", "llm"]
 
     def _get_per_model_brier(self, model_name: str, last_n: int = 20) -> tuple[float | None, int]:
         """
@@ -847,6 +847,10 @@ class ScoringContext:
     p_kalshi:       Optional[float] = None
     sub_questions:  Optional[list]  = None
     news_signals:   Optional[list]  = None    # liste de CrucixAlert
+    # ── Superforce live feeds ────────────────────────────────────────────
+    llm_estimate:   Optional[dict]  = None    # {p_estimate, confidence, reasoning, ...}
+    news_analysis:  Optional[dict]  = None    # {direction, magnitude, key_signals}
+    kalshi_divergence: Optional[dict] = None  # {divergence, direction, signal_strength}
 
 
 class ProbabilisticScorer:
@@ -902,10 +906,24 @@ class ProbabilisticScorer:
 
         else:
             # EventModel — toujours disponible
+            # Superforce : si Kalshi divergence détectée, utiliser son prix
+            p_kalshi = ctx.p_kalshi
+            if p_kalshi is None and ctx.kalshi_divergence:
+                p_kalshi = ctx.kalshi_divergence.get("kalshi_price")
+                log.info(f"Superforce Kalshi divergence: {ctx.kalshi_divergence.get('divergence', 0):+.3f}")
+
+            # Superforce : si LLM a fourni des sub_questions (Fermi), les utiliser
+            sub_q = ctx.sub_questions
+            if not sub_q and ctx.llm_estimate:
+                llm_subs = ctx.llm_estimate.get("sub_probabilities", [])
+                if llm_subs:
+                    sub_q = [(s.get("factor", ""), s.get("p", 0.5)) for s in llm_subs]
+                    log.info(f"Superforce LLM Fermi: {len(sub_q)} sub-questions")
+
             quant_result = self.event.get_probability(
                 ref_class_result=base_rate_result,
-                p_kalshi=ctx.p_kalshi,
-                sub_questions=ctx.sub_questions,
+                p_kalshi=p_kalshi,
+                sub_questions=sub_q,
             )
 
         # ── ÉTAPE 3 : Bayes update sur signaux news ────────────────────────
@@ -942,12 +960,34 @@ class ProbabilisticScorer:
                 p = p_new
             bayes_result = round(p, 4)
 
+        # ── ÉTAPE 3b : Intégration signaux Superforce (news_analysis) ────
+        # Si l'analyse LLM des news fournit direction+magnitude, l'appliquer
+        # comme ajustement bayésien supplémentaire sur le résultat courant
+        if ctx.news_analysis and bayes_result is None:
+            # Si pas de bayes_result des signaux classiques, partir du quant
+            p_base_for_news = quant_result["p_model"] if quant_result else base_rate_result["p_base"]
+            direction = ctx.news_analysis.get("direction", "neutral")
+            magnitude = min(0.15, abs(ctx.news_analysis.get("magnitude", 0)))
+            if direction == "bullish":
+                bayes_result = round(min(0.98, p_base_for_news + magnitude), 4)
+            elif direction == "bearish":
+                bayes_result = round(max(0.02, p_base_for_news - magnitude), 4)
+            if bayes_result is not None:
+                log.info(f"Superforce news_analysis: {direction} Δ{magnitude:.3f} → bayes={bayes_result}")
+        elif ctx.news_analysis and bayes_result is not None:
+            # Appliquer sur le bayes_result existant
+            direction = ctx.news_analysis.get("direction", "neutral")
+            magnitude = min(0.10, abs(ctx.news_analysis.get("magnitude", 0)))
+            if direction == "bullish":
+                bayes_result = round(min(0.98, bayes_result + magnitude * 0.5), 4)
+            elif direction == "bearish":
+                bayes_result = round(max(0.02, bayes_result - magnitude * 0.5), 4)
+
         # ── ÉTAPE 4 : Ensemble pondéré par Brier ──────────────────────────
-        # FIX #1 : On n'inclut PAS base_rate séparément car bayes_updated
-        # en dérive déjà (via quant qui absorbe l'outside view).
-        # L'ensemble combine 2 modèles *indépendants* :
+        # L'ensemble combine des modèles *indépendants* :
         #   - quant : signal quantitatif pur (crypto/macro/event)
         #   - bayes_updated : quant + news signals avec decay
+        #   - llm : estimation LLM indépendante (Superforce layer 4)
         # Si bayes_updated n'existe pas (aucun signal news), on utilise quant + base_rate
         # comme fallback pour avoir au moins 2 modèles.
         preds: dict[str, float] = {}
@@ -955,8 +995,18 @@ class ProbabilisticScorer:
             preds["quant"] = quant_result["p_model"]
         if bayes_result is not None:
             preds["bayes_updated"] = bayes_result
+        # LLM estimate = vue indépendante (non dérivée des mêmes données)
+        if ctx.llm_estimate and "p_estimate" in ctx.llm_estimate:
+            p_llm = ctx.llm_estimate["p_estimate"]
+            if 0.01 <= p_llm <= 0.99:
+                # Shrinkage selon confiance : high→faible, low→fort
+                confidence = ctx.llm_estimate.get("confidence", "medium")
+                shrinkage = {"high": 0.15, "medium": 0.30, "low": 0.50}.get(confidence, 0.30)
+                p_llm_shrunk = 0.5 + (p_llm - 0.5) * (1 - shrinkage)
+                preds["llm"] = round(p_llm_shrunk, 4)
+                log.info(f"Superforce LLM: p_raw={p_llm:.3f} conf={confidence} → p_shrunk={p_llm_shrunk:.3f}")
         # Fallback : si pas de news signals, ajouter base_rate comme 2ème vue
-        if "bayes_updated" not in preds and base_rate_result:
+        if "bayes_updated" not in preds and "llm" not in preds and base_rate_result:
             preds["base_rate"] = base_rate_result["p_base"]
 
         if not preds:

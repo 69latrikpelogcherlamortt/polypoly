@@ -143,6 +143,7 @@ from signals.signal_sources import SignalAggregator
 from signals.prob_model import (
     ProbabilisticScorer, HistoricalDB, ScoringContext, route_to_model
 )
+from signals.live_feeds import SuperforceAggregator
 from trading.execution import (
     AlmgrenChrissExecutor, select_profile, close_position, ExecutionParams
 )
@@ -259,6 +260,7 @@ class TradingBot:
         # ── Modèles ───────────────────────────────────────────────────────
         self.hist_db       = HistoricalDB(DB_PATH)
         self.scorer        = ProbabilisticScorer(self.trading_conn, self.hist_db)
+        self.superforce    = SuperforceAggregator()
         self.scanner       = MarketScanner(session=http_session)
         self.signals       = SignalAggregator(session=http_session)
         self.risk          = RiskManager(self.trade_repo, self.metrics)
@@ -479,6 +481,16 @@ class TradingBot:
                 val = float(m.group(1).replace(",", ""))
                 btc_target = val if 10_000 <= val <= 500_000 else None
 
+        # ── Superforce enrichment (live FRED + Finnhub + Kalshi + LLM) ──
+        try:
+            sf = self.superforce.enrich_scoring_context(question, price, category)
+        except Exception as e:
+            log.warning(f"Superforce enrichment failed: {e}")
+            sf = {}
+
+        # Macro data : Superforce FRED live > SignalAggregator > fallback
+        macro = sf.get("macro_data") or self.signals.get_latest_macro_data() or None
+
         ctx = ScoringContext(
             question     = question,
             market_price = price,
@@ -490,7 +502,11 @@ class TradingBot:
             btc_sigma    = 0.80,  # vol BTC par défaut
             p_fedwatch   = self._get_latest_fedwatch_prob(question),
             news_signals = context_alerts,
-            macro_data   = self.signals.get_latest_macro_data() or None,
+            macro_data   = macro,
+            # Superforce fields
+            llm_estimate      = sf.get("llm_estimate"),
+            news_analysis     = sf.get("news_analysis"),
+            kalshi_divergence = sf.get("kalshi_divergence"),
         )
 
         score = self.scorer.score(ctx)

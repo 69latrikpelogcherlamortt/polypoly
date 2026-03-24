@@ -54,6 +54,11 @@ BLS_API_KEY         = os.getenv("BLS_API_KEY", "")             # bls.gov (gratui
 TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")          # alertes Telegram
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ── Live Feeds (Superforce Information Edge) ──────────────────────────────
+FRED_API_KEY        = os.getenv("FRED_API_KEY", "")
+FINNHUB_API_KEY     = os.getenv("FINNHUB_API_KEY", "")
+ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. POLYMARKET ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════
