@@ -141,7 +141,8 @@ from core.database import init_trading_db, TradeRepository, MetricsEngine, Trade
 from trading.market_scanner import MarketScanner
 from signals.signal_sources import SignalAggregator
 from signals.prob_model import (
-    ProbabilisticScorer, HistoricalDB, ScoringContext, route_to_model
+    ProbabilisticScorer, HistoricalDB, ScoringContext, route_to_model,
+    calibrate_market_price, market_efficiency_score,
 )
 from signals.live_feeds import SuperforceAggregator
 from trading.execution import (
@@ -516,15 +517,19 @@ class TradingBot:
             return
 
         p_final     = score["p_final"]
-        edge        = score["edge"]
+        edge        = score["edge"]        # edge calibré (biais longshot inclus)
         uncertainty = score["uncertainty"]
         sigma_14d   = self.crucix.z_engine.get_sigma(candidate["market_id"], 0.06)
         z_score     = edge / max(sigma_14d, 0.03)
 
+        # Logguer les infos d'edge enrichies
+        ls_corr = score.get("longshot_correction", 0.0)
+        eff_tier = score.get("market_efficiency", {}).get("tier", "?")
         log.info(
             f"Candidat: {question[:50]}... "
-            f"p_final={p_final:.3f} price={price:.3f} "
-            f"edge={edge:+.3f} z={z_score:.2f} unc={uncertainty:.2f}"
+            f"p_final={p_final:.3f} p_mkt={price:.3f} p_mkt_cal={score.get('p_market_calibrated', price):.3f} "
+            f"edge={edge:+.3f}(raw={score.get('edge_raw', edge):+.3f}) "
+            f"ls_corr={ls_corr:+.3f} tier={eff_tier} z={z_score:.2f} unc={uncertainty:.2f}"
         )
 
         # Valider les 7 gates

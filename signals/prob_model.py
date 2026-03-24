@@ -710,6 +710,113 @@ class BrierWeightedEnsemble:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 4B. CORRECTEUR DE BIAIS LONGSHOT — Edge structurel
+# ═══════════════════════════════════════════════════════════════════════════
+
+def calibrate_market_price(p_market: float) -> float:
+    """
+    Corrige le biais longshot empirique des marchés prédictifs.
+
+    Source : Forsythe et al. (1992), Wolfers & Zitzewitz (2004),
+             Arrow et al. (2008) — convergent sur les marchés prédictifs.
+
+    Observation empirique :
+      - Un marché à 4%  représente une vraie probabilité de ~2.5% → overpriced 37%
+      - Un marché à 8%  représente une vraie probabilité de ~5.5% → overpriced 31%
+      - Un marché à 15% représente une vraie probabilité de ~13%  → overpriced 13%
+      - Marchés 20-80% : bien calibrés → pas de correction
+      - Symétrie inverse pour les near-certainties (92-98% sous-pricés)
+
+    USAGE : edge_calibré = p_model - calibrate_market_price(p_market)
+    Cela capture l'alpha du biais EN PLUS de l'alpha du modèle.
+
+    Exemple : market=5%, p_model=5% (aucune info)
+      - edge_brut = 0.00 (ne pas trader)
+      - edge_calibré = 5% - 3.2% = +1.8% (SELL le longshot overpriced ✓)
+    """
+    p = max(0.01, min(0.99, p_market))
+
+    # Table de correction basée sur la littérature
+    # (facteur appliqué à la probabilité brute ou à la distance à 1)
+    if p <= 0.04:
+        factor = 0.60   # p_true ≈ 60% de p_market
+    elif p <= 0.08:
+        factor = 0.70
+    elif p <= 0.15:
+        factor = 0.83
+    elif p <= 0.20:
+        factor = 0.92
+    elif p <= 0.80:
+        factor = 1.00   # zone bien calibrée
+    elif p <= 0.85:
+        factor = 0.92   # symétrie
+    elif p <= 0.92:
+        factor = 0.83
+    elif p <= 0.96:
+        factor = 0.70
+    else:
+        factor = 0.60
+
+    if p <= 0.50:
+        return max(0.01, p * factor)
+    else:
+        dist = 1.0 - p
+        return min(0.99, 1.0 - dist * factor)
+
+
+def market_efficiency_score(volume_total: float, volume_24h: float,
+                             days_to_res: float, n_traders: int = 0) -> dict:
+    """
+    Évalue l'efficience du marché pour décider si l'edge du modèle est exploitable.
+
+    Principe : la sagesse des foules nécessite une vraie foule.
+    - Volume total < 5k$  → marché mort, spread trop large
+    - Volume total 5-50k$ → marché fin, modèle a un avantage
+    - Volume 50-200k$     → marché semi-efficient, edge marginal
+    - Volume > 200k$      → marché efficient, modèle n'a pas d'avantage structurel
+
+    Retourne :
+      score       : 0.0 (très efficient) → 1.0 (très inefficient, exploitable)
+      tier        : "dead" | "thin" | "semi" | "efficient"
+      tradeable   : bool (recommandation)
+    """
+    vol = max(0.0, volume_total)
+
+    if vol < 2_000:
+        return {"score": 0.0, "tier": "dead",      "tradeable": False,
+                "reason": "volume_trop_faible"}
+    elif vol < 15_000:
+        score = 0.85
+        tier  = "thin"
+    elif vol < 50_000:
+        score = 0.65
+        tier  = "semi"
+    elif vol < 200_000:
+        score = 0.35
+        tier  = "semi_efficient"
+    else:
+        score = 0.10
+        tier  = "efficient"
+
+    # Bonus : résolution proche → plus d'info disponible, moins de bruit
+    if 1 <= days_to_res <= 7:
+        score = min(1.0, score + 0.15)
+
+    # Pénalité : si volume_24h très bas, marché en train de mourir
+    if volume_24h < 100 and vol < 20_000:
+        score = max(0.0, score - 0.20)
+
+    tradeable = score >= 0.35 and tier != "efficient"
+
+    return {
+        "score":     round(score, 3),
+        "tier":      tier,
+        "tradeable": tradeable,
+        "reason":    f"vol={vol:.0f}$ tier={tier}",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 5. DÉCISION FINALE + EXTREMIZING ADAPTATIF — ÉTAPE 5
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1079,20 +1186,48 @@ class ProbabilisticScorer:
         if result is None:
             return {"tradeable": False, "reason": reason}
 
-        # Edge calcul
+        # ── Edge calcul : brut + calibré (biais longshot) ─────────────────
         p_final = result["p_final"]
-        edge    = p_final - ctx.market_price
+        edge_raw = p_final - ctx.market_price
+
+        # Correction biais longshot : le marché overestimate les longshots
+        # p_market_calibrated est la "vraie" valeur que le marché offre
+        p_market_calibrated = calibrate_market_price(ctx.market_price)
+        edge_calibrated     = p_final - p_market_calibrated
+        longshot_correction = round(ctx.market_price - p_market_calibrated, 4)
+
+        # L'edge opérationnel = edge calibré (tient compte du biais structurel)
+        # Si longshot_correction > 0 : biais longshot → SELL est avantageux
+        # Si longshot_correction < 0 : near-certainty → BUY est avantageux
+        edge = edge_calibrated
+
+        # Efficience du marché
+        eff = market_efficiency_score(
+            volume_total  = ctx.volume_24h * 7,   # estimation volume total ~7j
+            volume_24h    = ctx.volume_24h,
+            days_to_res   = ctx.days_to_res,
+        )
 
         result.update({
-            "model_type":         model_type,
-            "p_market":           ctx.market_price,
-            "edge":               round(edge, 4),
-            "base_rate":          base_rate_result["p_base"],
-            "quant_model":        quant_result["p_model"] if quant_result else None,
-            "news_adjusted":      preds.get("quant_adjusted"),
-            "n_historical":       self.rce.db.count(),
-            "model_predictions":  model_predictions_snapshot,
+            "model_type":           model_type,
+            "p_market":             ctx.market_price,
+            "p_market_calibrated":  round(p_market_calibrated, 4),
+            "edge":                 round(edge, 4),
+            "edge_raw":             round(edge_raw, 4),
+            "longshot_correction":  longshot_correction,
+            "market_efficiency":    eff,
+            "base_rate":            base_rate_result["p_base"],
+            "quant_model":          quant_result["p_model"] if quant_result else None,
+            "news_adjusted":        preds.get("quant_adjusted"),
+            "n_historical":         self.rce.db.count(),
+            "model_predictions":    model_predictions_snapshot,
         })
+
+        # Bloquer les marchés trop efficients (edge non exploitable)
+        if not eff["tradeable"]:
+            log.info(f"Marché trop efficient: {eff['reason']} — skip")
+            result["tradeable"] = False
+            result["reason"]    = f"marche_efficient:{eff['tier']}"
 
         log.info(
             f"Score: p_final={p_final:.3f} market={ctx.market_price:.3f} "
