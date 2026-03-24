@@ -15,6 +15,13 @@ DEFAULT_PARAMS = {
     "KELLY_FRACTION_LONGSHOT": 0.125,
 }
 
+# Bounds validation: (min, max) for each parameter prefix
+PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+    "BAYESIAN_HARD_CAP":  (0.05, 0.25),
+    "Z_SCORE_THRESHOLD":  (0.5, 4.0),
+    "KELLY_FRACTION":     (0.01, 0.50),
+}
+
 
 class DynamicConfig:
     def __init__(self, db_conn: sqlite3.Connection):
@@ -69,8 +76,22 @@ class DynamicConfig:
         self._cache[param] = row[0]
         return row[0]
 
+    def _validate_bounds(self, param: str, value: float) -> float:
+        """Clamp value to allowed bounds. Logs a warning if clamped."""
+        for prefix, (lo, hi) in PARAM_BOUNDS.items():
+            if param.startswith(prefix):
+                clamped = max(lo, min(hi, value))
+                if clamped != value:
+                    log.warning(
+                        "DynamicConfig: %s=%.4f clamped to [%.2f, %.2f] → %.4f",
+                        param, value, lo, hi, clamped,
+                    )
+                return clamped
+        return value
+
     def set(self, param: str, value: float, reason: str):
         """Persist a new value for *param* and update the cache."""
+        value = self._validate_bounds(param, value)
         now = datetime.now(timezone.utc).isoformat()
         self.db_conn.execute(
             """

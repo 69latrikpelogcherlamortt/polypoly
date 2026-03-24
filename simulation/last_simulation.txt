@@ -1,0 +1,432 @@
+⚠  MODE PAPER TRADING ACTIF — aucun ordre réel ne sera passé
+KILL SWITCH NIVEAU 4: PF 1.00 < 1.2
+CME FedWatch fetch failed: 403, message='Forbidden', url='https://www.cmegroup.com/CmeWS/mvc/GetFedWatch/ProbHistoricalData'
+RSS fetch https://feeds.reuters.com/reuters/topNews: Cannot connect to host feeds.reuters.com:443 ssl:default [Domain name not found]
+RSS fetch https://feeds.reuters.com/reuters/businessNews: Cannot connect to host feeds.reuters.com:443 ssl:default [Domain name not found]
+RSS fetch https://feeds.reuters.com/reuters/politicsNews: Cannot connect to host feeds.reuters.com:443 ssl:default [Domain name not found]
+RSS XML parse error https://apnews.com/apf-topnews: not well-formed (invalid token): line 350, column 32
+======================================================================
+  PAF-001 -- SIMULATION COMPLETE -- 2026-03-20 08:28 UTC
+======================================================================
+
+----------------------------------------------------------------------
+  BLOC 1 -- ETAT ACTUEL DU BOT
+----------------------------------------------------------------------
+  Bankroll courante                   100.00 EUR
+  Positions ouvertes                  0 / 8 max
+  Exposition totale                   0.00 EUR  (0.0%)
+  PnL non realise                     +0.00 EUR
+  Mode                                DRY_RUN=true  PAPER_TRADING=true 
+
+  Kill switches :
+    [V] Bankroll >= MIN                100.00 >= 60.0
+    [V] MDD < 8%                       0.00% < 8%
+    [V] Brier < 0.22                   0.1500 < 0.22
+    [V] Pertes consecutives < 5        0 < 5
+    [V] Daily loss OK                  ok
+    [V] Sharpe / PF OK                 Sharpe=0.00  PF=1.00
+
+  [!] KILL SWITCH ACTIF -- aucun nouveau trade dans ce cycle
+  [!] Raison : Profit Factor 1.00 < 1.2 — recalibration
+
+----------------------------------------------------------------------
+  BLOC 2 -- SCAN DES MARCHES POLYMARKET
+----------------------------------------------------------------------
+  Criteres de selection :
+  Volume 24h minimum                  5,000 $
+  Distance resolution                 5-21 jours (S1) 
+  Mode                                Scan via Gamma API (async) 
+
+  [>] Connexion a Gamma API...
+  [V] Scan termine en 3.68s
+  Candidats S1 (favoris)              0 
+  Candidats S2 (longshots)            0 
+
+  [!] Aucun candidat trouve -- marche peut-etre ferme ou illiquide
+  [>] 5 marches de demonstration charges
+
+----------------------------------------------------------------------
+  BLOC 3 -- COLLECTE DES SIGNAUX
+----------------------------------------------------------------------
+  Sources de signaux et poids actuels :
+    Source                    Categorie          Poids  Barre
+----------------------------------------------------------------------
+    cme_fedwatch              macro_fed         1.000  [##########]  actif
+    deribit_vol               crypto            1.000  [##########]  actif
+    bls_economic              macro_fed         1.000  [##########]  actif
+    kalshi                    cross             1.000  [##########]  actif
+    nitter_sentiment          politics          1.000  [##########]  actif
+    polymarket_flow           momentum          1.000  [##########]  actif
+    rss_news                  events            1.000  [##########]  actif
+    binance_ws                crypto            1.000  [##########]  actif
+    predictit                 politics          1.000  [##########]  actif
+    tetlock_llm               calibration       1.000  [##########]  actif
+
+  [>] Collecte des signaux en cours (asyncio.gather)...
+  [V] Collecte terminee en 8.70s (budget: 25s)
+  Alertes recues                      7 
+
+  SIGNAUX COLLECTES :
+    Source                 Direction     Magnitude Categorie      
+-----------------------------------------------------------------
+    deribit_vol            BEARISH          0.0200 AlertCategory. 
+    deribit_vol            BEARISH          0.0100 AlertCategory. 
+    deribit_vol            BEARISH          0.0100 AlertCategory. 
+    deribit_vol            BEARISH          0.0100 AlertCategory. 
+    fed_gov_statement      NEUTRAL          0.4200 AlertCategory. 
+    twitter_t2             BEARISH          0.3500 AlertCategory. 
+    twitter_t2             BEARISH          0.3500 AlertCategory. 
+
+----------------------------------------------------------------------
+  BLOC 4 -- PIPELINE DECISIONNEL COMPLET (MARCHE PAR MARCHE)
+----------------------------------------------------------------------
+
+  == MARCHE 1 =======================================================
+  | Will the Fed cut rates at the June 2026 FOMC meeting?
+  | ID: 0xfed001
+  | Prix YES: 0.7200  |  Vol 24h: 125,000$  |  Jours: 15  |  Cat: macro_fed  |  Strat: S1
+  =================================================================
+
+  >> ETAPE 1 : PIPELINE BAYESIEN
+     Prior (prix marche)     : 0.7200 (72.0%)
+  [>] Aucun signal pertinent pour cette categorie -- p_model = p_prior
+
+  >> ETAPE 2 : CALIBRATION PLATT SCALING
+     Pas encore calibre (< 20 resolutions)
+     p_model = 0.7200 (identite)
+
+  >> ETAPE 3 : Z-SCORE ADAPTATIF
+     p_model            : 0.7200 (72.0%)
+     p_market           : 0.7200 (72.0%)
+     Edge               : +0.0000 (+0.0%)
+     Sigma (est.)       : 0.0300
+     Z-score            : +0.000  (seuil macro_fed: 1.5)
+     EV estime          : 0.0000
+
+  >> ETAPE 4 : ANALYSE DU TIMING
+     Score timing        : [###############] 1.000
+     Jours a resolution  : 15j
+     Decision timing     : FAVORABLE
+       -> No adverse conditions detected
+
+  >> ETAPE 5 : VALIDATION 7 GATES
+     [X] Gate Edge minimum           [FAIL]  0.0000 >= 0.04
+     [X] Gate EV positif             [FAIL]  0.0000 > 0
+     [X] Gate Kelly > 0              [FAIL]  0.0000 EUR
+     [V] Gate Exposition OK          [PASS]  0/8 positions
+     [V] Gate MDD OK                 [PASS]  0.00% < 8%
+     [V] Gate Brier OK               [PASS]  0.1500 < 0.22
+     => Action gates : BLOCK  |  Size approuvee: 0.0000 EUR
+     => Failures : ['edge_gate', 'ev_gate']
+
+  >> ETAPE 6 : PORTFOLIO RISK GATES
+     VaR 95% portfolio actuel   : 0.00%  (limite: 15%)
+     HHI concentration          : 1.0000
+     Positions effectives       : 0.00
+     Perte correlee max         : 0.00%  (limite: 20%)
+     [V] Portfolio gate : portfolio_risk_gates_passed
+
+  >> ETAPE 7 : SIZING KELLY FRACTIONNEL
+     Type                   : FAVORI (1/4 Kelly (favori))
+     Kelly brut             : 0.0000 EUR
+     Cap MAX_TRADE_EUR       : 5.00 EUR
+     Cap MAX_TRADE_PCT       : 5% x 100.00 = 5.00 EUR
+     Kelly apres caps       : 0.0000 EUR (0.0% bankroll)
+
+  >> DECISION FINALE
+  [X] PAS DE TRADE
+       X Kill switch actif
+       X Gates refuses : ['edge_gate', 'ev_gate']
+       X Edge insuffisant (0.0000 < 0.04)
+       X Kelly sizing = 0
+
+  == MARCHE 2 =======================================================
+  | Will BTC exceed $150,000 before May 2026?
+  | ID: 0xbtc001
+  | Prix YES: 0.3800  |  Vol 24h: 89,000$  |  Jours: 42  |  Cat: crypto  |  Strat: S1
+  =================================================================
+
+  >> ETAPE 1 : PIPELINE BAYESIEN
+     Prior (prix marche)     : 0.3800 (38.0%)
+     deribit_vol                : LR=0.971 w=1.000 | 0.3800 v 0.3731 (d=-0.0069)
+     deribit_vol                : LR=0.985 w=1.000 | 0.3731 v 0.3696 (d=-0.0035)
+     deribit_vol                : LR=0.985 w=1.000 | 0.3696 v 0.3661 (d=-0.0035)
+     deribit_vol                : LR=0.985 w=1.000 | 0.3661 v 0.3627 (d=-0.0034)
+
+  >> ETAPE 2 : CALIBRATION PLATT SCALING
+     Pas encore calibre (< 20 resolutions)
+     p_model = 0.3627 (identite)
+
+  >> ETAPE 3 : Z-SCORE ADAPTATIF
+     p_model            : 0.3627 (36.3%)
+     p_market           : 0.3800 (38.0%)
+     Edge               : -0.0173 (-1.7%)
+     Sigma (est.)       : 0.0300
+     Z-score            : -0.578  (seuil crypto: 1.5)
+     EV estime          : -0.0456
+
+  >> ETAPE 4 : ANALYSE DU TIMING
+     Score timing        : [###############] 1.000
+     Jours a resolution  : 42j
+     Decision timing     : FAVORABLE
+       -> No adverse conditions detected
+
+  >> ETAPE 5 : VALIDATION 7 GATES
+     [X] Gate Edge minimum           [FAIL]  -0.0173 >= 0.04
+     [X] Gate EV positif             [FAIL]  -0.0456 > 0
+     [X] Gate Kelly > 0              [FAIL]  0.0000 EUR
+     [V] Gate Exposition OK          [PASS]  0/8 positions
+     [V] Gate MDD OK                 [PASS]  0.00% < 8%
+     [V] Gate Brier OK               [PASS]  0.1500 < 0.22
+     => Action gates : BLOCK  |  Size approuvee: 0.0000 EUR
+     => Failures : ['edge_gate', 'ev_gate']
+
+  >> ETAPE 6 : PORTFOLIO RISK GATES
+     VaR 95% portfolio actuel   : 0.00%  (limite: 15%)
+     HHI concentration          : 1.0000
+     Positions effectives       : 0.00
+     Perte correlee max         : 0.00%  (limite: 20%)
+     [V] Portfolio gate : portfolio_risk_gates_passed
+
+  >> ETAPE 7 : SIZING KELLY FRACTIONNEL
+     Type                   : FAVORI (1/4 Kelly (favori))
+     Kelly brut             : 0.0000 EUR
+     Cap MAX_TRADE_EUR       : 5.00 EUR
+     Cap MAX_TRADE_PCT       : 5% x 100.00 = 5.00 EUR
+     Kelly apres caps       : 0.0000 EUR (0.0% bankroll)
+
+  >> DECISION FINALE
+  [X] PAS DE TRADE
+       X Kill switch actif
+       X Gates refuses : ['edge_gate', 'ev_gate']
+       X Edge insuffisant (-0.0173 < 0.04)
+       X Kelly sizing = 0
+
+  == MARCHE 3 =======================================================
+  | Will CPI inflation be below 2.5% in March 2026?
+  | ID: 0xcpi001
+  | Prix YES: 0.6100  |  Vol 24h: 45,000$  |  Jours: 10  |  Cat: macro_fed  |  Strat: S1
+  =================================================================
+
+  >> ETAPE 1 : PIPELINE BAYESIEN
+     Prior (prix marche)     : 0.6100 (61.0%)
+  [>] Aucun signal pertinent pour cette categorie -- p_model = p_prior
+
+  >> ETAPE 2 : CALIBRATION PLATT SCALING
+     Pas encore calibre (< 20 resolutions)
+     p_model = 0.6100 (identite)
+
+  >> ETAPE 3 : Z-SCORE ADAPTATIF
+     p_model            : 0.6100 (61.0%)
+     p_market           : 0.6100 (61.0%)
+     Edge               : +0.0000 (+0.0%)
+     Sigma (est.)       : 0.0300
+     Z-score            : +0.000  (seuil macro_fed: 1.5)
+     EV estime          : 0.0000
+
+  >> ETAPE 4 : ANALYSE DU TIMING
+     Score timing        : [###############] 1.000
+     Jours a resolution  : 10j
+     Decision timing     : FAVORABLE
+       -> No adverse conditions detected
+
+  >> ETAPE 5 : VALIDATION 7 GATES
+     [X] Gate Edge minimum           [FAIL]  0.0000 >= 0.04
+     [X] Gate EV positif             [FAIL]  0.0000 > 0
+     [X] Gate Kelly > 0              [FAIL]  0.0000 EUR
+     [V] Gate Exposition OK          [PASS]  0/8 positions
+     [V] Gate MDD OK                 [PASS]  0.00% < 8%
+     [V] Gate Brier OK               [PASS]  0.1500 < 0.22
+     => Action gates : BLOCK  |  Size approuvee: 0.0000 EUR
+     => Failures : ['edge_gate', 'ev_gate']
+
+  >> ETAPE 6 : PORTFOLIO RISK GATES
+     VaR 95% portfolio actuel   : 0.00%  (limite: 15%)
+     HHI concentration          : 1.0000
+     Positions effectives       : 0.00
+     Perte correlee max         : 0.00%  (limite: 20%)
+     [V] Portfolio gate : portfolio_risk_gates_passed
+
+  >> ETAPE 7 : SIZING KELLY FRACTIONNEL
+     Type                   : FAVORI (1/4 Kelly (favori))
+     Kelly brut             : 0.0000 EUR
+     Cap MAX_TRADE_EUR       : 5.00 EUR
+     Cap MAX_TRADE_PCT       : 5% x 100.00 = 5.00 EUR
+     Kelly apres caps       : 0.0000 EUR (0.0% bankroll)
+
+  >> DECISION FINALE
+  [X] PAS DE TRADE
+       X Kill switch actif
+       X Gates refuses : ['edge_gate', 'ev_gate']
+       X Edge insuffisant (0.0000 < 0.04)
+       X Kelly sizing = 0
+
+  == MARCHE 4 =======================================================
+  | Will the Boston Celtics win the 2026 NBA Championship?
+  | ID: 0xnba001
+  | Prix YES: 0.0800  |  Vol 24h: 32,000$  |  Jours: 90  |  Cat: sports  |  Strat: S2
+  =================================================================
+
+  >> ETAPE 1 : PIPELINE BAYESIEN
+     Prior (prix marche)     : 0.0800 (8.0%)
+  [>] Aucun signal pertinent pour cette categorie -- p_model = p_prior
+
+  >> ETAPE 2 : CALIBRATION PLATT SCALING
+     Pas encore calibre (< 20 resolutions)
+     p_model = 0.0800 (identite)
+
+  >> ETAPE 3 : Z-SCORE ADAPTATIF
+     p_model            : 0.0800 (8.0%)
+     p_market           : 0.0800 (8.0%)
+     Edge               : +0.0000 (+0.0%)
+     Sigma (est.)       : 0.0300
+     Z-score            : +0.000  (seuil sports: 2.0)
+     EV estime          : 0.0000
+
+  >> ETAPE 4 : ANALYSE DU TIMING
+     Score timing        : [###############] 1.000
+     Jours a resolution  : 90j
+     Decision timing     : FAVORABLE
+       -> No adverse conditions detected
+
+  >> ETAPE 5 : VALIDATION 7 GATES
+     [X] Gate Edge minimum           [FAIL]  0.0000 >= 0.04
+     [X] Gate EV positif             [FAIL]  0.0000 > 0
+     [X] Gate Kelly > 0              [FAIL]  0.0000 EUR
+     [V] Gate Exposition OK          [PASS]  0/8 positions
+     [V] Gate MDD OK                 [PASS]  0.00% < 8%
+     [V] Gate Brier OK               [PASS]  0.1500 < 0.22
+     => Action gates : BLOCK  |  Size approuvee: 0.0000 EUR
+     => Failures : ['edge_gate', 'ev_gate', 'z_score_gate_longshot', 's2_edge_ratio_gate', 's2_edge_abs_gate']
+
+  >> ETAPE 6 : PORTFOLIO RISK GATES
+     VaR 95% portfolio actuel   : 0.00%  (limite: 15%)
+     HHI concentration          : 1.0000
+     Positions effectives       : 0.00
+     Perte correlee max         : 0.00%  (limite: 20%)
+     [V] Portfolio gate : portfolio_risk_gates_passed
+
+  >> ETAPE 7 : SIZING KELLY FRACTIONNEL
+     Type                   : LONGSHOT (1/8 Kelly (longshot))
+     Kelly brut             : 0.0000 EUR
+     Cap MAX_TRADE_EUR       : 5.00 EUR
+     Cap MAX_TRADE_PCT       : 5% x 100.00 = 5.00 EUR
+     Kelly apres caps       : 0.0000 EUR (0.0% bankroll)
+
+  >> DECISION FINALE
+  [X] PAS DE TRADE
+       X Kill switch actif
+       X Gates refuses : ['edge_gate', 'ev_gate', 'z_score_gate_longshot', 's2_edge_ratio_gate', 's2_edge_abs_gate']
+       X Edge insuffisant (0.0000 < 0.04)
+       X Kelly sizing = 0
+
+  == MARCHE 5 =======================================================
+  | Will there be a US government shutdown in Q2 2026?
+  | ID: 0xpol001
+  | Prix YES: 0.1500  |  Vol 24h: 67,000$  |  Jours: 45  |  Cat: other  |  Strat: S2
+  =================================================================
+
+  >> ETAPE 1 : PIPELINE BAYESIEN
+     Prior (prix marche)     : 0.1500 (15.0%)
+  [>] Aucun signal pertinent pour cette categorie -- p_model = p_prior
+
+  >> ETAPE 2 : CALIBRATION PLATT SCALING
+     Pas encore calibre (< 20 resolutions)
+     p_model = 0.1500 (identite)
+
+  >> ETAPE 3 : Z-SCORE ADAPTATIF
+     p_model            : 0.1500 (15.0%)
+     p_market           : 0.1500 (15.0%)
+     Edge               : +0.0000 (+0.0%)
+     Sigma (est.)       : 0.0300
+     Z-score            : +0.000  (seuil other: 1.5)
+     EV estime          : 0.0000
+
+  >> ETAPE 4 : ANALYSE DU TIMING
+     Score timing        : [###############] 1.000
+     Jours a resolution  : 45j
+     Decision timing     : FAVORABLE
+       -> No adverse conditions detected
+
+  >> ETAPE 5 : VALIDATION 7 GATES
+     [X] Gate Edge minimum           [FAIL]  0.0000 >= 0.04
+     [X] Gate EV positif             [FAIL]  0.0000 > 0
+     [X] Gate Kelly > 0              [FAIL]  0.0000 EUR
+     [V] Gate Exposition OK          [PASS]  0/8 positions
+     [V] Gate MDD OK                 [PASS]  0.00% < 8%
+     [V] Gate Brier OK               [PASS]  0.1500 < 0.22
+     => Action gates : BLOCK  |  Size approuvee: 0.0000 EUR
+     => Failures : ['edge_gate', 'ev_gate', 'z_score_gate_longshot', 's2_edge_ratio_gate', 's2_edge_abs_gate']
+
+  >> ETAPE 6 : PORTFOLIO RISK GATES
+     VaR 95% portfolio actuel   : 0.00%  (limite: 15%)
+     HHI concentration          : 1.0000
+     Positions effectives       : 0.00
+     Perte correlee max         : 0.00%  (limite: 20%)
+     [V] Portfolio gate : portfolio_risk_gates_passed
+
+  >> ETAPE 7 : SIZING KELLY FRACTIONNEL
+     Type                   : LONGSHOT (1/8 Kelly (longshot))
+     Kelly brut             : 0.0000 EUR
+     Cap MAX_TRADE_EUR       : 5.00 EUR
+     Cap MAX_TRADE_PCT       : 5% x 100.00 = 5.00 EUR
+     Kelly apres caps       : 0.0000 EUR (0.0% bankroll)
+
+  >> DECISION FINALE
+  [X] PAS DE TRADE
+       X Kill switch actif
+       X Gates refuses : ['edge_gate', 'ev_gate', 'z_score_gate_longshot', 's2_edge_ratio_gate', 's2_edge_abs_gate']
+       X Edge insuffisant (0.0000 < 0.04)
+       X Kelly sizing = 0
+
+----------------------------------------------------------------------
+  BLOC 5 -- RESUME DE LA SIMULATION
+----------------------------------------------------------------------
+  Marches scannes                     5 
+  Marches analyses                    5 
+  Candidats au trade                  0 
+  Rejetes                             5 
+
+  [>] Aucun trade candidat dans ce cycle
+  [>] Raisons typiques : edge insuffisant, marches tres efficaces, ou kill switch actif
+
+----------------------------------------------------------------------
+  BLOC 6 -- ETAT DU MODELE (PARAMETRES DYNAMIQUES)
+----------------------------------------------------------------------
+  Parametres ajustes par SelfImprovementEngine :
+
+    Parametre                                Valeur Modifie le             Raison
+------------------------------------------------------------------------------------------
+    BAYESIAN_HARD_CAP                        0.1500 2026-03-20T08:26:28.2  default
+    Z_SCORE_THRESHOLD_macro_fed              1.5000 2026-03-20T08:26:28.2  default
+    Z_SCORE_THRESHOLD_crypto                 1.5000 2026-03-20T08:26:28.2  default
+    Z_SCORE_THRESHOLD_politics               1.8000 2026-03-20T08:26:28.2  default
+    Z_SCORE_THRESHOLD_sports                 2.0000 2026-03-20T08:26:28.2  default
+    Z_SCORE_THRESHOLD_other                  1.5000 2026-03-20T08:26:28.2  default
+    KELLY_FRACTION_FAVORI                    0.2500 2026-03-20T08:26:28.2  default
+    KELLY_FRACTION_LONGSHOT                  0.1250 2026-03-20T08:26:28.2  default
+
+  Performance des sources :
+  [>] Pas de donnees de performance -- SourceTracker vide (nouveau deploiement)
+
+----------------------------------------------------------------------
+  BLOC 7 -- VERDICT DE LA SIMULATION
+----------------------------------------------------------------------
+  Ce cycle de simulation montre que le bot :
+
+    [V] Scan des marches               5 marches eligibles trouves
+    [V] Pipeline Bayesien              Fonctionne, 7 signaux collectes
+    [V] Gates fonctionnels             Tous les gates evalues correctement
+    [V] Sizing Kelly                   Tailles calculees selon les caps configures
+    [V] Portfolio risk                 VaR95=0.00% calculee
+    [!] Kill switches                  DECLENCHE: Profit Factor 1.00 < 1.2 — recalibration
+    [V] Candidats identifies           0 trade(s) candidat(s)
+
+======================================================================
+  SIMULATION VERDICT : [!] POINTS A VERIFIER
+  Voir les elements marques [!] ci-dessus
+======================================================================
+
+  Pour lancer le paper trading :
+  DRY_RUN=true PAPER_TRADING=true python main.py
+

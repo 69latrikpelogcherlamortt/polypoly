@@ -31,6 +31,7 @@ from core.config import (
     REPRICE_IMBALANCE_WAIT, REPRICE_OFFSET,
     EDGE_MIN,
 )
+from trading.reconciliation import OrderDeduplicator
 
 FILL_RATE_THRESHOLD = 0.80   # minimum fill rate to consider execution successful
 
@@ -197,9 +198,10 @@ class AlmgrenChrissExecutor:
     3. Retourner E(IS) espéré vs réalisé
     """
 
-    def __init__(self, clob, params: ExecutionParams):
-        self.clob = clob
-        self.p    = params
+    def __init__(self, clob, params: ExecutionParams, dedup: OrderDeduplicator | None = None):
+        self.clob  = clob
+        self.p     = params
+        self.dedup = dedup
 
     # ── 1. TRAJECTOIRE ────────────────────────────────────────────────────
 
@@ -306,7 +308,7 @@ class AlmgrenChrissExecutor:
                 log.info(f"Slice {i}: limit_price {limit_price:.4f} > max {max_price:.4f}, stop")
                 break
 
-            order = self._place_limit(token_id, limit_price, remaining)
+            order = await self._place_limit(token_id, limit_price, remaining)
             if not order:
                 continue
 
@@ -323,7 +325,8 @@ class AlmgrenChrissExecutor:
 
                 try:
                     status = self.clob.get_order(order_id)
-                except Exception:
+                except Exception as e:
+                    log.warning("get_order(%s) failed: %s — aborting slice", order_id, e)
                     break
 
                 if getattr(status, "status", "") == "FILLED":
@@ -357,7 +360,7 @@ class AlmgrenChrissExecutor:
                         remaining = 0
                         break
                     self._cancel(order_id)
-                    order = self._place_limit(token_id, new_price, remaining)
+                    order = await self._place_limit(token_id, new_price, remaining)
                     if order:
                         order_id      = order.id
                         last_mid      = new_ob["mid"]
@@ -423,8 +426,8 @@ class AlmgrenChrissExecutor:
             "dry_run":         True,
         }
 
-    def _place_limit(self, token_id: str, price: float, size: float,
-                     _max_retries: int = 3) -> dict | None:
+    async def _place_limit(self, token_id: str, price: float, size: float,
+                           _max_retries: int = 3) -> dict | None:
         """
         Place un limit order BUY via py-clob-client.
         Retry avec backoff exponentiel sur erreurs réseau transitoires (429, 5xx).
@@ -436,12 +439,24 @@ class AlmgrenChrissExecutor:
         args = OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
         delay = 1.0  # secondes, double à chaque retry
 
+        # Idempotency check: prevent duplicate orders on retry
+        if self.dedup:
+            idem_key = OrderDeduplicator.generate_idempotency_key(
+                token_id, "BUY", price, size,
+            )
+            if self.dedup.is_duplicate(idem_key):
+                log.warning("_place_limit: duplicate order blocked (key=%s)", idem_key[:16])
+                return None
+
         for attempt in range(1, _max_retries + 1):
             try:
                 signed = self.clob.create_order(args)
                 result = self.clob.post_order(signed, OrderType.GTC)
                 if attempt > 1:
                     log.info(f"_place_limit: succès à la tentative {attempt}")
+                if self.dedup and result:
+                    order_id = result.get("id") or result.get("order_id", "")
+                    self.dedup.record(idem_key, order_id, "placed")
                 return result
             except Exception as e:
                 err_str = str(e).lower()
@@ -454,10 +469,7 @@ class AlmgrenChrissExecutor:
                         f"_place_limit tentative {attempt}/{_max_retries} échouée: {e} "
                         f"— retry dans {delay:.0f}s"
                     )
-                    # Sync sleep acceptable here: _place_limit is called within
-                    # the per-slice execution loop which already uses await asyncio.sleep
-                    # between slices. The retry delay is short (1-30s) and only on error.
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
                     delay = min(delay * 2, 30.0)  # backoff exponentiel, max 30s
                 else:
                     log.error(
@@ -514,8 +526,8 @@ async def handle_partial_fill(
         if edge_current < EDGE_MIN:
             try:
                 clob.cancel_order(state.order_id)
-            except Exception:
-                pass
+            except Exception as e:
+                log.error("cancel_order(%s) failed on edge_mort: %s", state.order_id, e)
             return {
                 "action":       "cancel",
                 "reason":       "edge_mort",
@@ -551,10 +563,10 @@ async def handle_partial_fill(
 
         try:
             clob.cancel_order(state.order_id)
-        except Exception:
-            pass
+        except Exception as e:
+            log.error("cancel_order(%s) failed before reprice: %s", state.order_id, e)
 
-        new_order = executor._place_limit(
+        new_order = await executor._place_limit(
             state.token_id, new_price, state.remaining
         )
         if new_order:
@@ -688,5 +700,5 @@ async def close_position(
         return {"status": "timeout", "fill_rate": 0}
 
     except Exception as e:
-        log.error(f"close_position: {e}")
+        log.error("close_position(%s) failed: %s — manual review required", token_id, e)
         return {"status": "error", "reason": str(e)}

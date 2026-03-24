@@ -674,16 +674,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
 
     def _check_token(self) -> bool:
-        """Vérifie le token dans query string (?t=...) ou header Authorization."""
-        # Authorization: Bearer <token>
+        """Vérifie le token via header Authorization: Bearer <token> uniquement."""
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             candidate = auth[7:]
             if secrets.compare_digest(candidate, _DASHBOARD_TOKEN):
                 return True
-        # Query string : ?t=<token>
-        if f"t={_DASHBOARD_TOKEN}" in self.path:
-            return True
         return False
 
     def do_GET(self):
@@ -703,7 +699,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("WWW-Authenticate", 'Bearer realm="PAF-001 Dashboard"')
             self.end_headers()
-            self.wfile.write(b"401 Unauthorized - token requis (?t=TOKEN ou header Authorization: Bearer TOKEN)")
+            self.wfile.write(b"401 Unauthorized - header Authorization: Bearer TOKEN requis")
             return
 
         # Normaliser path (strip token query string pour la logique de routage)
@@ -753,13 +749,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     url       = f"http://localhost:{PORT}"
-    url_auth  = f"{url}/?t={_DASHBOARD_TOKEN}"
 
     print("=" * 60)
     print("  PAF-001 Dashboard Server  —  LIVE (3s polling)")
     print("=" * 60)
-    print(f"  Dashboard : {url_auth}")
-    print(f"  API JSON  : {url}/api/data?t={_DASHBOARD_TOKEN}")
+    print(f"  Dashboard : {url}")
+    print(f"  API JSON  : {url}/api/data")
+    print(f"  Auth      : Authorization: Bearer {_DASHBOARD_TOKEN}")
     print(f"  Token     : {_DASHBOARD_TOKEN}  (généré à ce démarrage)")
     print(f"  DB        : {DB_PATH.resolve()}")
     print(f"  Signal DB : {SIGNAL_DB.resolve()}")
@@ -770,7 +766,7 @@ if __name__ == "__main__":
     print()
 
     server = HTTPServer(("127.0.0.1", PORT), _Handler)
-    webbrowser.open(url_auth)  # ouvre avec le token intégré dans l'URL
+    webbrowser.open(url)  # token doit être envoyé via header, pas URL
     try:
         server.serve_forever()
     except KeyboardInterrupt:
