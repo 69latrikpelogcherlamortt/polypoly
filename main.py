@@ -640,6 +640,12 @@ class TradingBot:
         )
         self.trade_repo.insert_trade(trade)
 
+        # Enregistrer les predictions per-model pour le Brier tracking
+        if "model_predictions" in score and score["model_predictions"]:
+            self.trade_repo.record_model_predictions(
+                market_id, score["model_predictions"]
+            )
+
         # Créer position
         sigma_pos = self.crucix.z_engine.get_sigma(market_id, 0.06)
         pos = OpenPosition(
@@ -762,6 +768,8 @@ class TradingBot:
             p_at_resolution  = p_resolution,
             exit_reason      = "resolution",
         )
+        # Resoudre les predictions per-model pour recalibrer le Brier ensemble
+        self.trade_repo.resolve_model_predictions(pos.market_id, outcome)
         self.trade_repo.remove_position(pos.market_id)
 
         # Mettre à jour bankroll (réel et DRY_RUN pour Kelly sizing cohérent)

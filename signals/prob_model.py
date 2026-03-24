@@ -490,63 +490,77 @@ class EventModel:
 
 class BrierWeightedEnsemble:
     """
-    w_i = exp(-Brier_i) / Σ exp(-Brier_j)
+    w_i = exp(-Brier_i) / S exp(-Brier_j)
 
-    Les modèles les mieux calibrés reçoivent plus de poids.
-    Minimum 5 résolutions pour calculer les poids — sinon poids égaux.
+    FIX Bug #2 : per-model Brier tracking via model_predictions table.
     """
 
-    def __init__(self, db_conn: sqlite3.Connection):
-        self.conn   = db_conn
+    MIN_SAMPLES = 5
+
+    def __init__(self, db_conn):
+        import sqlite3
+        self.conn = db_conn
         self.models = ["base_rate", "quant", "bayes_updated"]
 
-    def _get_model_predictions(self, model_tag: str, n: int = 20) -> list[float]:
+    def _get_per_model_brier(self, model_name, last_n=20):
         rows = self.conn.execute("""
-            SELECT p_model FROM trades
-            WHERE status='closed' AND outcome IS NOT NULL
-            ORDER BY exit_ts DESC LIMIT ?
-        """, (n,)).fetchall()
-        return [r[0] for r in rows]
+            SELECT mp.p_predicted, mp.outcome
+            FROM model_predictions mp
+            JOIN trades t ON mp.market_id = t.market_id
+            WHERE mp.model_name = ?
+              AND mp.outcome IS NOT NULL
+              AND t.status = 'closed'
+            ORDER BY t.exit_ts DESC LIMIT ?
+        """, (model_name, last_n)).fetchall()
+        n = len(rows)
+        if n < self.MIN_SAMPLES:
+            return None, n
+        brier = sum((p - o) ** 2 for p, o in rows) / n
+        return brier, n
 
-    def _get_outcomes(self, n: int = 20) -> list[int]:
-        rows = self.conn.execute("""
-            SELECT outcome FROM trades
-            WHERE status='closed' AND outcome IS NOT NULL
-            ORDER BY exit_ts DESC LIMIT ?
-        """, (n,)).fetchall()
-        return [r[0] for r in rows]
+    def compute_weights(self, last_n=20):
+        brier_scores = {}
+        n_samples = {}
+        for model in self.models:
+            b, n = self._get_per_model_brier(model, last_n)
+            brier_scores[model] = b
+            n_samples[model] = n
+        calibrated = {m: b for m, b in brier_scores.items() if b is not None}
+        if not calibrated:
+            equal_w = 1.0 / len(self.models)
+            log.debug("BrierEnsemble: not enough history, equal weights")
+            return {m: equal_w for m in self.models}
+        exp_weights = {m: float(np.exp(-b)) for m, b in calibrated.items()}
+        total_exp = sum(exp_weights.values())
+        norm_weights = {m: w / total_exp for m, w in exp_weights.items()}
+        avg_weight = sum(norm_weights.values()) / len(norm_weights)
+        weights = {}
+        for m in self.models:
+            weights[m] = norm_weights.get(m, avg_weight)
+        total = sum(weights.values())
+        weights = {m: w / total for m, w in weights.items()}
+        log.info("BrierEnsemble weights: %s (brier: %s, samples: %s)",
+            {m: f"{w:.3f}" for m, w in weights.items()},
+            {m: f"{b:.4f}" if b is not None else "N/A" for m, b in brier_scores.items()},
+            n_samples)
+        return weights
 
-    def compute_weights(self, last_n: int = 20) -> dict[str, float]:
-        preds   = self._get_model_predictions("all", last_n)
-        outcomes = self._get_outcomes(last_n)
-
-        if len(preds) < 5:
-            # Poids égaux si pas assez d'historique
-            return {m: 1.0 / len(self.models) for m in self.models}
-
-        brier = np.mean([(p - o) ** 2 for p, o in zip(preds, outcomes)])
-        # Un seul Brier global → distribuer aux 3 modèles (à affiner avec tracking par modèle)
-        exp_val = np.exp(-brier)
-        total   = exp_val * len(self.models)
-        return {m: exp_val / total for m in self.models}
-
-    def combine(self, predictions_dict: dict[str, float]) -> dict:
+    def combine(self, predictions_dict):
         weights = self.compute_weights()
-        p_ensemble = sum(
-            weights.get(m, 0) * p
-            for m, p in predictions_dict.items()
-        )
-        probs  = list(predictions_dict.values())
+        active_weights = {m: weights.get(m, 0) for m in predictions_dict}
+        total_w = sum(active_weights.values())
+        if total_w > 0:
+            active_weights = {m: w / total_w for m, w in active_weights.items()}
+        p_ensemble = sum(active_weights.get(m, 0) * p for m, p in predictions_dict.items())
+        probs = list(predictions_dict.values())
         spread = max(probs) - min(probs) if len(probs) > 1 else 0.0
         return {
-            "p_final":      round(p_ensemble, 4),
-            "weights_used": weights,
+            "p_final": round(p_ensemble, 4),
+            "weights_used": active_weights,
             "model_spread": round(spread, 4),
-            "signal":       (
-                "fort"  if spread < 0.10 else
-                "moyen" if spread < 0.20 else "faible"
-            ),
+            "signal": ("fort" if spread < 0.10 else "moyen" if spread < 0.20 else "faible"),
         }
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -747,6 +761,9 @@ class ProbabilisticScorer:
         if not preds:
             return {"tradeable": False, "reason": "no_models_available"}
 
+        # Sauvegarder les predictions per-model pour le Brier tracking
+        model_predictions_snapshot = dict(preds)
+
         ens = self.ensemble.combine(preds)
 
         # ── ÉTAPE 5 : Décision finale + extremizing ────────────────────────
@@ -769,6 +786,7 @@ class ProbabilisticScorer:
             "quant_model":        quant_result["p_model"] if quant_result else None,
             "bayes_updated":      bayes_result,
             "n_historical":       self.rce.db.count(),
+            "model_predictions":  model_predictions_snapshot,
         })
 
         log.info(

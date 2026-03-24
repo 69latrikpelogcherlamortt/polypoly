@@ -228,6 +228,24 @@ def init_trading_db(path: Path = DB_PATH) -> sqlite3.Connection:
         )
     """)
 
+    # ── Model predictions (per-model Brier) ─────────────────────────────
+
+    def record_model_predictions(self, market_id, predictions):
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+        with self._lock:
+            for mn, pp in predictions.items():
+                self.conn.execute(
+                    "INSERT INTO model_predictions (market_id,model_name,p_predicted,recorded_at) VALUES (?,?,?,?)",
+                    (market_id, mn, pp, now))
+            self.conn.commit()
+
+    def resolve_model_predictions(self, market_id, outcome):
+        with self._lock:
+            self.conn.execute(
+                "UPDATE model_predictions SET outcome=? WHERE market_id=? AND outcome IS NULL",
+                (outcome, market_id))
+            self.conn.commit()
+
     # ── Reprice log ──────────────────────────────────────────────────────
     c.execute("""
         CREATE TABLE IF NOT EXISTS reprice_log (
@@ -243,6 +261,26 @@ def init_trading_db(path: Path = DB_PATH) -> sqlite3.Connection:
             outcome        INTEGER,
             filled_after   INTEGER
         )
+    """)
+
+    # ── Model predictions (per-model Brier tracking) ────────────────────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS model_predictions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id   TEXT    NOT NULL,
+            model_name  TEXT    NOT NULL,
+            p_predicted REAL    NOT NULL,
+            outcome     INTEGER,
+            recorded_at TEXT    NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_mp_market
+            ON model_predictions (market_id)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_mp_model_name
+            ON model_predictions (model_name)
     """)
 
     # ── Kill switch state ────────────────────────────────────────────────
@@ -592,7 +630,7 @@ class MetricsEngine:
             ORDER BY exit_ts DESC LIMIT ?
         """, (n,)).fetchall()
         if not rows:
-            return 1.0
+            return 999.99
         gains  = sum(r[0] for r in rows if r[0] > 0)
         losses = sum(abs(r[0]) for r in rows if r[0] < 0)
         return round(gains / losses, 3) if losses > 0 else 999.99
