@@ -338,13 +338,17 @@ class MacroFedModel:
     detect_macro_direction() analyse la question pour déterminer quoi mapper.
     """
 
+    # FIX #4 : fed_funds_rate → signe positif (+0.38)
+    # Économiquement : taux élevé → plus de marge pour couper → P(cut) augmente
+    # L'ancien -0.38 était inversé (calibration artefact, pas causalité)
+    # Shrinkage global de 20% sur tous les coefficients pour réduire l'overfit
     LOGIT_COEFFS = {
-        "intercept":     -2.10,
-        "cpi_yoy":       -0.82,
-        "unemployment":  +0.63,
-        "gdp_growth":    -0.41,
-        "fed_funds_rate":-0.38,
-        "yield_curve":   +0.95,
+        "intercept":      -2.10 * 0.8,
+        "cpi_yoy":        -0.82 * 0.8,
+        "unemployment":   +0.63 * 0.8,
+        "gdp_growth":     -0.41 * 0.8,
+        "fed_funds_rate": +0.38 * 0.8,   # FIX: signe corrigé + shrinkage
+        "yield_curve":    +0.95 * 0.8,
     }
 
     @staticmethod
@@ -526,7 +530,15 @@ class EventModel:
         ref_class_result: dict,
         p_kalshi: Optional[float] = None,
         sub_questions: Optional[list[tuple[str, float]]] = None,
+        p_market: Optional[float] = None,
+        days_to_res: Optional[float] = None,
     ) -> dict:
+        """
+        FIX #5 : EventModel enrichi
+        - Market price anchor : le prix Polymarket EST de l'information
+          (efficience partielle). Ancrage léger w=0.3 pour ne pas être circulaire.
+        - Temps restant : si < 3j, augmenter le poids des sources live
+        """
         sources = [("base_rate", ref_class_result["p_base"], 1.0)]
 
         if p_kalshi is not None:
@@ -537,12 +549,23 @@ class EventModel:
             if p_fermi:
                 sources.append(("fermi", p_fermi, 1.2))
 
+        # FIX #5 : market price anchor (léger, pour ne pas être circulaire)
+        # Le marché Polymarket contient de l'information agrégée — l'ignorer
+        # complètement est aussi une erreur. Poids faible = 0.3
+        if p_market is not None and 0.05 < p_market < 0.95:
+            sources.append(("market_anchor", p_market, 0.3))
+
+        # FIX #5 : si proche de l'expiration, les sources live (Kalshi, Fermi)
+        # sont plus fiables que le base_rate historique
+        if days_to_res is not None and days_to_res < 3:
+            sources = [
+                (name, p, w * (2.0 if name != "base_rate" else 0.5))
+                for name, p, w in sources
+            ]
+
         total_w    = sum(w for _, _, w in sources)
         p_ensemble = sum(p * w for _, p, w in sources) / total_w
 
-        n       = len(sources)
-        # NOTE: extremizing géré uniquement par final_decision() pour éviter
-        # le double extremizing (EventModel + final_decision = biais ~+5-7¢)
         p_final = p_ensemble
 
         return {
@@ -576,7 +599,7 @@ class BrierWeightedEnsemble:
 
     def __init__(self, db_conn: sqlite3.Connection):
         self.conn   = db_conn
-        self.models = ["base_rate", "quant", "bayes_updated", "llm"]
+        self.models = ["quant_adjusted", "llm", "base_rate"]
 
     def _get_per_model_brier(self, model_name: str, last_n: int = 20) -> tuple[float | None, int]:
         """
@@ -693,41 +716,32 @@ class BrierWeightedEnsemble:
 def final_decision(
     base_rate_result: Optional[dict],
     quant_result: Optional[dict],
-    bayes_result: Optional[float],
     ensemble: dict,
+    preds: dict,
+    days_to_res: float = 30.0,
     brier_calibrated: bool = False,
 ) -> tuple[Optional[dict], str]:
     """
     Synthèse finale + extremizing adaptatif.
 
-    FIX #2 : l'extremizing n'est appliqué que si le Brier ensemble est
-    calibré (≥ MIN_BRIER_FOR_EXTREMIZE trades résolus par modèle).
-    Sans calibration, amplifier les probabilités amplifie les erreurs.
-
-    FIX #3 : l'intervalle de confiance utilise min/max (enveloppe)
-    au lieu de la moyenne, pour refléter le vrai désaccord inter-modèles.
-
-    Règles d'extremizing (si calibré) :
-    - 2+ sources convergentes (spread < 0.12) → α = 1.3
-    - 2+ sources                              → α = 1.15
-    - 1 source ou non calibré                 → α = 1.0 (off)
+    FIX #1 : supprime bayes_result (plus de variable séparée)
+    FIX #6 : uncertainty pondérée par temps restant
+    FIX #7 : ne pas rejeter les signaux "faibles" si l'edge est fort
     """
-    if ensemble["signal"] == "faible":
-        return None, "signal_trop_faible"
-
     p_raw     = ensemble["p_final"]
-    n_sources = sum(1 for r in [quant_result, bayes_result]
-                    if r is not None)
-    # base_rate compte comme source supplémentaire seulement s'il est
-    # dans l'ensemble (fallback quand pas de bayes_updated)
-    if base_rate_result and "base_rate" in ensemble.get("weights_used", {}):
-        n_sources += 1
+    n_sources = len(preds)
+    spread    = ensemble["model_spread"]
+
+    # FIX #7 : ne rejeter que si spread > 0.25 ET < 2 sources
+    # Un spread élevé avec 2+ sources = désaccord informatif, pas "faible"
+    if spread > 0.25 and n_sources < 2:
+        return None, "signal_trop_faible"
 
     extremized = False
     p_final = p_raw
 
     if brier_calibrated and n_sources >= 2:
-        if ensemble["model_spread"] < 0.12:
+        if spread < 0.12:
             alpha = 1.3
         else:
             alpha = 1.15
@@ -739,8 +753,7 @@ def final_decision(
 
     p_final = max(0.01, min(0.99, p_final))
 
-    # FIX #3 : Intervalles — enveloppe (min/max) au lieu de moyenne
-    # Reflète le vrai niveau de désaccord entre modèles
+    # Intervalles — enveloppe (min/max)
     all_lows = []
     all_highs = []
     for r in [base_rate_result, quant_result]:
@@ -757,7 +770,23 @@ def final_decision(
 
     low  = max(0.0, float(low))
     high = min(1.0, float(high))
-    uncertainty = high - low
+    raw_uncertainty = high - low
+
+    # FIX #6 : uncertainty scaling par temps restant
+    # Proche de l'expiration → plus de confiance dans le modèle
+    # Loin de l'expiration → uncertainty augmente (plus de temps pour surprises)
+    if days_to_res <= 1:
+        time_factor = 0.7   # très proche → réduire uncertainty
+    elif days_to_res <= 7:
+        time_factor = 0.85
+    elif days_to_res <= 30:
+        time_factor = 1.0   # baseline
+    elif days_to_res <= 90:
+        time_factor = 1.15
+    else:
+        time_factor = 1.3   # long terme → plus d'incertitude
+
+    uncertainty = min(0.95, raw_uncertainty * time_factor)
 
     return {
         "p_final":        round(p_final, 4),
@@ -807,18 +836,35 @@ def route_to_model(question: str) -> str:
             return "event"
 
     # ── Marchés crypto PRIX (Black-Scholes a du sens) ──
-    crypto_price_kw = ["bitcoin", "btc", "eth", "ethereum", "solana", "sol", "crypto"]
-    price_kw = ["price", "above", "below", "reach", "hit", "exceed",
-                "100k", "120k", "150k", "200k", "50k", "75k"]
+    # FIX #9 : keywords étendus pour meilleure couverture
+    crypto_price_kw = [
+        "bitcoin", "btc", "eth", "ethereum", "solana", "sol", "crypto",
+        "xrp", "ripple", "cardano", "ada", "dogecoin", "doge", "bnb",
+        "avalanche", "avax", "polkadot", "dot", "matic", "polygon",
+    ]
+    price_kw = [
+        "price", "above", "below", "reach", "hit", "exceed", "trading at",
+        "100k", "120k", "150k", "200k", "50k", "75k", "250k",
+        "1000", "2000", "3000", "4000", "5000", "10000",
+        "$", "usd", "worth",
+    ]
     has_crypto = any(kw in q for kw in crypto_price_kw)
     has_price  = any(kw in q for kw in price_kw)
     if has_crypto and has_price:
         return "crypto"
 
     # ── Marchés macro/Fed ──
-    fed_kw = ["fed", "federal reserve", "interest rate", "fomc",
-              "rate cut", "rate hike", "bps", "25bps", "50bps",
-              "monetary policy", "inflation target", "quantitative"]
+    # FIX #9 : keywords macro étendus
+    fed_kw = [
+        "fed", "federal reserve", "interest rate", "fomc",
+        "rate cut", "rate hike", "bps", "25bps", "50bps",
+        "monetary policy", "inflation target", "quantitative",
+        "jerome powell", "powell", "jay powell", "dot plot",
+        "treasury yield", "yield curve", "cpi ", "pce ",
+        "nonfarm", "non-farm", "payroll", "unemployment rate",
+        "gdp growth", "recession", "soft landing", "hard landing",
+        "tightening", "easing", "hawkish", "dovish",
+    ]
     if any(kw in q for kw in fed_kw):
         return "macro"
 
@@ -882,7 +928,10 @@ class ProbabilisticScorer:
 
         if model_type == "crypto" and ctx.btc_spot and ctx.btc_target:
             T = ctx.days_to_res / 365.0
-            sigma = ctx.btc_sigma if ctx.btc_sigma is not None else 0.80
+            # FIX #2 : 0.80 était un fallback trop élevé (80% annualisée = mouvement extrême)
+            # BTC IV typique Deribit : 45-65% en régime normal, 70-90% en crise
+            # Fallback 0.60 si pas de données Deribit live
+            sigma = ctx.btc_sigma if ctx.btc_sigma is not None else 0.60
             quant_result = self.crypto.get_probability(
                 S=ctx.btc_spot, K=ctx.btc_target, T=T, sigma=sigma
             )
@@ -924,16 +973,19 @@ class ProbabilisticScorer:
                 ref_class_result=base_rate_result,
                 p_kalshi=p_kalshi,
                 sub_questions=sub_q,
+                p_market=ctx.market_price,
+                days_to_res=ctx.days_to_res,
             )
 
         # ── ÉTAPE 3 : Bayes update sur signaux news ────────────────────────
-        # FIX #1+#4 : part du quant_result (pas du base_rate pour éviter le
-        #   double-comptage dans l'ensemble) + applique temporal decay et cap ±15%
-        #   comme le fait CrucixRouter pour les positions ouvertes.
-        bayes_result = None
+        # Le Bayes update MODIFIE le quant_result, il ne crée pas un modèle
+        # séparé. bayes_updated remplace quant dans l'ensemble (pas les deux).
+        # Temporal decay + cap ±15% par source.
+        p_quant = quant_result["p_model"] if quant_result else base_rate_result["p_base"]
+        p_news_adjusted = p_quant  # point de départ
+
+        has_news_update = False
         if ctx.news_signals:
-            # Point de départ = quant (information nouvelle), pas base_rate
-            p = quant_result["p_model"] if quant_result else base_rate_result["p_base"]
             now = datetime.now(timezone.utc)
             for signal in ctx.news_signals:
                 lr_bull, lr_bear = LR_PRIOR.get(signal.source_id, (1.20, 0.833))
@@ -943,70 +995,68 @@ class ProbabilisticScorer:
                     dir_value = None
                 if dir_value not in ("bullish", "bearish"):
                     continue
-                # Temporal decay : LR_eff = 1 + (LR - 1) × exp(-λ × age_min)
                 age_min = max(0.0, (now - signal.timestamp).total_seconds() / 60.0)
                 decay = math.exp(-0.0025 * age_min)
                 if dir_value == "bullish":
                     lr_eff = 1.0 + (lr_bull - 1.0) * decay
-                    odds = p / (1 - p) * lr_eff
                 else:
-                    lr_eff = 1.0 + (lr_bear - 1.0) * decay  # lr_bear < 1
-                    odds = p / (1 - p) * lr_eff
+                    lr_eff = 1.0 + (lr_bear - 1.0) * decay
+                odds = p_news_adjusted / max(1 - p_news_adjusted, 1e-9) * lr_eff
                 p_new = max(0.02, min(0.98, odds / (1 + odds)))
-                # Hard cap ±15% par source unique
-                delta = p_new - p
+                delta = p_new - p_news_adjusted
                 if abs(delta) > 0.15:
-                    p_new = p + math.copysign(0.15, delta)
-                p = p_new
-            bayes_result = round(p, 4)
+                    p_new = p_news_adjusted + math.copysign(0.15, delta)
+                p_news_adjusted = p_new
+                has_news_update = True
 
-        # ── ÉTAPE 3b : Intégration signaux Superforce (news_analysis) ────
-        # Si l'analyse LLM des news fournit direction+magnitude, l'appliquer
-        # comme ajustement bayésien supplémentaire sur le résultat courant
-        if ctx.news_analysis and bayes_result is None:
-            # Si pas de bayes_result des signaux classiques, partir du quant
-            p_base_for_news = quant_result["p_model"] if quant_result else base_rate_result["p_base"]
+        # ── ÉTAPE 3b : Superforce news_analysis (vrai Bayes, pas additif) ─
+        # FIX #3 critique : convertir magnitude en likelihood ratio au lieu
+        # d'ajouter directement. Magnitude 0.05 → LR ≈ 1.2, 0.10 → LR ≈ 1.5
+        if ctx.news_analysis:
             direction = ctx.news_analysis.get("direction", "neutral")
             magnitude = min(0.15, abs(ctx.news_analysis.get("magnitude", 0)))
-            if direction == "bullish":
-                bayes_result = round(min(0.98, p_base_for_news + magnitude), 4)
-            elif direction == "bearish":
-                bayes_result = round(max(0.02, p_base_for_news - magnitude), 4)
-            if bayes_result is not None:
-                log.info(f"Superforce news_analysis: {direction} Δ{magnitude:.3f} → bayes={bayes_result}")
-        elif ctx.news_analysis and bayes_result is not None:
-            # Appliquer sur le bayes_result existant
-            direction = ctx.news_analysis.get("direction", "neutral")
-            magnitude = min(0.10, abs(ctx.news_analysis.get("magnitude", 0)))
-            if direction == "bullish":
-                bayes_result = round(min(0.98, bayes_result + magnitude * 0.5), 4)
-            elif direction == "bearish":
-                bayes_result = round(max(0.02, bayes_result - magnitude * 0.5), 4)
+            if direction in ("bullish", "bearish") and magnitude > 0.01:
+                # Convertir magnitude en LR : LR = exp(3 × magnitude)
+                # 0.03→1.09, 0.05→1.16, 0.10→1.35, 0.15→1.57
+                lr = math.exp(3.0 * magnitude)
+                if direction == "bearish":
+                    lr = 1.0 / lr
+                odds = p_news_adjusted / max(1 - p_news_adjusted, 1e-9) * lr
+                p_news_adjusted = max(0.02, min(0.98, odds / (1 + odds)))
+                has_news_update = True
+                log.info(f"Superforce news: {direction} mag={magnitude:.3f} LR={lr:.3f} → p={p_news_adjusted:.4f}")
 
-        # ── ÉTAPE 4 : Ensemble pondéré par Brier ──────────────────────────
-        # L'ensemble combine des modèles *indépendants* :
-        #   - quant : signal quantitatif pur (crypto/macro/event)
-        #   - bayes_updated : quant + news signals avec decay
-        #   - llm : estimation LLM indépendante (Superforce layer 4)
-        # Si bayes_updated n'existe pas (aucun signal news), on utilise quant + base_rate
-        # comme fallback pour avoir au moins 2 modèles.
+        # ── ÉTAPE 4 : Ensemble de modèles INDÉPENDANTS ───────────────────
+        # Architecture : on ne met dans l'ensemble que des sources qui ne
+        # partagent PAS le même signal sous-jacent.
+        #
+        # - "quant_or_bayes" : le meilleur signal quantitatif (quant enrichi
+        #   par news si disponible). UN seul slot, pas deux.
+        # - "llm" : estimation LLM SANS les données quant en contexte
+        #   (FIX #8 : le LLM reçoit la question + news, mais PAS les données
+        #   FRED/macro qui alimentent déjà le quant).
+        # - "base_rate" : seulement si aucune autre source secondaire.
         preds: dict[str, float] = {}
-        if quant_result:
-            preds["quant"] = quant_result["p_model"]
-        if bayes_result is not None:
-            preds["bayes_updated"] = bayes_result
-        # LLM estimate = vue indépendante (non dérivée des mêmes données)
+
+        # Slot 1 : meilleur signal quantitatif (news-adjusted si dispo)
+        if has_news_update:
+            preds["quant_adjusted"] = round(p_news_adjusted, 4)
+        elif quant_result:
+            preds["quant_adjusted"] = quant_result["p_model"]
+
+        # Slot 2 : LLM (source indépendante — raisonnement, pas données)
         if ctx.llm_estimate and "p_estimate" in ctx.llm_estimate:
             p_llm = ctx.llm_estimate["p_estimate"]
             if 0.01 <= p_llm <= 0.99:
-                # Shrinkage selon confiance : high→faible, low→fort
                 confidence = ctx.llm_estimate.get("confidence", "medium")
-                shrinkage = {"high": 0.15, "medium": 0.30, "low": 0.50}.get(confidence, 0.30)
+                # Shrinkage adaptatif : LLM peu fiable → fort shrinkage
+                shrinkage = {"high": 0.20, "medium": 0.35, "low": 0.55}.get(confidence, 0.35)
                 p_llm_shrunk = 0.5 + (p_llm - 0.5) * (1 - shrinkage)
                 preds["llm"] = round(p_llm_shrunk, 4)
-                log.info(f"Superforce LLM: p_raw={p_llm:.3f} conf={confidence} → p_shrunk={p_llm_shrunk:.3f}")
-        # Fallback : si pas de news signals, ajouter base_rate comme 2ème vue
-        if "bayes_updated" not in preds and "llm" not in preds and base_rate_result:
+                log.info(f"Superforce LLM: p_raw={p_llm:.3f} conf={confidence} → shrunk={p_llm_shrunk:.3f}")
+
+        # Slot 3 : base_rate — uniquement comme fallback si < 2 sources
+        if len(preds) < 2 and base_rate_result:
             preds["base_rate"] = base_rate_result["p_base"]
 
         if not preds:
@@ -1021,7 +1071,8 @@ class ProbabilisticScorer:
         # ── ÉTAPE 5 : Décision finale + extremizing ────────────────────────
         brier_ok = self.ensemble.is_calibrated()
         result, reason = final_decision(
-            base_rate_result, quant_result, bayes_result, ens,
+            base_rate_result, quant_result, ens, preds,
+            days_to_res=ctx.days_to_res,
             brier_calibrated=brier_ok,
         )
 
@@ -1038,7 +1089,7 @@ class ProbabilisticScorer:
             "edge":               round(edge, 4),
             "base_rate":          base_rate_result["p_base"],
             "quant_model":        quant_result["p_model"] if quant_result else None,
-            "bayes_updated":      bayes_result,
+            "news_adjusted":      preds.get("quant_adjusted"),
             "n_historical":       self.rce.db.count(),
             "model_predictions":  model_predictions_snapshot,
         })
