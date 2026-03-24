@@ -277,7 +277,8 @@ class CryptoModel:
         for n in range(n_terms):
             factorial_n = math.factorial(n)
             w_n         = poisson_weight * (lambda_j * T) ** n / factorial_n
-            r_n         = r - lambda_j * (np.exp(mu_j + 0.5 * sigma_j ** 2) - 1) + n * mu_j / max(T, 1e-6)
+            # FIX: ajout du terme 0.5*sigma_j^2 manquant dans le drift par saut (Merton 1976)
+            r_n         = r - lambda_j * (np.exp(mu_j + 0.5 * sigma_j ** 2) - 1) + n * (mu_j + 0.5 * sigma_j ** 2) / max(T, 1e-6)
             r_n         = np.clip(r_n, -10, 10)
             sigma_n     = np.sqrt(sigma ** 2 + n * sigma_j ** 2 / max(T, 1e-6))
             prob       += w_n * self.black_scholes_prob(S, K, T, r_n, sigma_n)
@@ -367,11 +368,18 @@ class MacroFedModel:
                 [0.03, -0.01, 0.01, 1.5],
                 method="Nelder-Mead",
             )
-            b0, b1, _, tau = result.x
+            b0, b1, b2, tau = result.x
             if tau <= 0:
                 return 0.5
-            slope  = b0 - (b0 + b1)
-            return float(expit(slope * 10))
+            # FIX: utiliser la pente réelle de la courbe fittée (10Y - 3M)
+            # au lieu de slope = -b1 qui perdait l'info de courbure β₂
+            rate_short = ns_curve(result.x, 0.25)   # 3 mois
+            rate_long  = ns_curve(result.x, 10.0)   # 10 ans
+            slope = rate_long - rate_short
+            # Courbure (β₂) : signal additionnel sur attentes de taux futurs
+            curvature_signal = b2 * 5.0
+            combined = slope * 15.0 + curvature_signal
+            return float(expit(combined))
         except Exception:
             return 0.5
 
@@ -462,7 +470,9 @@ class EventModel:
         p_ensemble = sum(p * w for _, p, w in sources) / total_w
 
         n       = len(sources)
-        p_final = self.extremize(p_ensemble, alpha=1.3) if n >= 2 else p_ensemble
+        # NOTE: extremizing géré uniquement par final_decision() pour éviter
+        # le double extremizing (EventModel + final_decision = biais ~+5-7¢)
+        p_final = p_ensemble
 
         return {
             "p_model":   round(p_final, 4),

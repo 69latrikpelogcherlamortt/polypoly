@@ -1042,9 +1042,18 @@ class MultiSourceAggregator:
 
         # ── Chaînage Bayésien ────────────────────────────────────────────
         p = max(0.02, min(0.98, market.p_model))   # guard against 0/1 before odds calc
+        seen_groups: dict[str, bool] = {}
         for u in valid:
-            trust     = self.cal.get_trust_weight(u.source_id)
-            eff_lr    = 1.0 + trust * (u.lr_applied - 1.0)
+            # FIX: trust déjà appliqué dans CalibrationEngine.get_calibrated_lr()
+            # On applique ici uniquement la pénalité de corrélation inter-sources
+            group = SOURCE_CORRELATION_GROUPS.get(u.source_id)
+            if group and group in seen_groups:
+                # Source corrélée déjà vue → réduire le LR (√(1/N) contribution)
+                eff_lr = 1.0 + 0.5 * (u.lr_applied - 1.0)
+            else:
+                eff_lr = u.lr_applied
+            if group:
+                seen_groups[group] = True
             odds      = p / (1 - p)
             odds     *= eff_lr
             p         = max(0.02, min(0.98, odds / (1 + odds)))
@@ -1167,8 +1176,10 @@ class DynamicZScoreEngine:
         prices = prices[-self.WINDOW_DAYS:]   # garder seulement 14 points
 
         if len(prices) >= 3:
-            diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-            sigma = statistics.stdev(diffs) if len(diffs) >= 2 else statistics.mean(diffs)
+            # FIX: stdev sur variations brutes (pas abs) pour mesurer la vraie dispersion
+            # abs() biaisait sigma vers 0 quand le prix oscillait régulièrement
+            diffs = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            sigma = statistics.stdev(diffs) if len(diffs) >= 2 else abs(statistics.mean(diffs))
             sigma = max(self.SIGMA_MIN, min(self.SIGMA_MAX, sigma))
         else:
             sigma = 0.06
