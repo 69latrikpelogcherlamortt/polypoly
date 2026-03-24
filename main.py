@@ -544,6 +544,7 @@ class TradingBot:
             is_longshot     = is_longshot,
             z_score         = z_score,
             returns_history = self._returns_history,
+            question        = question,
         )
 
         if not gate.passed or gate.action != "TRADE":

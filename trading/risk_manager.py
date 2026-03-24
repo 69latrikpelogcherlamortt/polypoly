@@ -150,6 +150,7 @@ class GateCheckInput:
     z_score:            float = 0.0
     p_model:            float = 0.0
     market_price:       float = 0.0
+    question:           str   = ""
 
 
 @dataclass
@@ -609,8 +610,15 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "macro_fed": ["fed", "fomc", "rate", "powell", "inflation", "cpi", "bls"],
     "crypto": ["btc", "bitcoin", "eth", "ethereum", "crypto", "solana"],
     "politics": ["election", "president", "congress", "senate", "trump", "biden"],
-    "sports": ["nba", "nfl", "mlb", "nhl", "super bowl", "championship"],
-    "geopolitics": ["ukraine", "russia", "china", "taiwan", "war", "nato"],
+    "sports": ["nba", "nfl", "mlb", "nhl", "super bowl", "championship",
+               "tennis", "atp", "wta", "wimbledon", "grand slam", "open",
+               "soccer", "football", "basketball", "baseball", "hockey",
+               "golf", "pga", "formula", "f1", "ufc", "boxing", "olympic"],
+    "geopolitics": ["ukraine", "russia", "china", "taiwan", "war", "nato",
+                    "israel", "iran", "netanyahu", "gaza", "hamas", "middle east",
+                    "kharg", "tehran", "moscow", "beijing", "north korea"],
+    "commodities": ["oil", "crude", "wti", "brent", "gas", "gold", "silver",
+                    "wheat", "corn", "copper", "natural gas", "energy"],
 }
 
 
@@ -729,6 +737,7 @@ class RiskManager:
         is_longshot: bool,
         z_score: float,
         returns_history: list[float],
+        question: str = "",
     ) -> GateCheckResult:
         """
         Valide qu'un nouveau trade peut être ouvert.
@@ -758,15 +767,14 @@ class RiskManager:
             z_score         = z_score,
             p_model         = p_model,
             market_price    = market_price,
+            question        = question,
         )
         result = self.gate.validate(inp)
 
         # Concentration risk gate (post 7-gates)
         if result.passed or result.action in ("TRADE", "REDUCE"):
-            # Need question from one of the positions context — use p_model search
-            # The caller should pass question; for now check by positions list
             conc_ok, conc_reason = check_concentration_risk(
-                getattr(positions[0], 'question', '') if positions else '',
+                inp.question,
                 positions
             )
             if not conc_ok:
