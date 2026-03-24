@@ -332,6 +332,10 @@ class MacroFedModel:
     Coefficients Logit calibrés OLS (1990-2025) :
     intercept -2.10 / cpi_yoy -0.82 / unemployment +0.63 /
     gdp_growth -0.41 / fed_funds_rate -0.38 / yield_curve +0.95
+
+    FIX #7 : Le logit modélise P(rate cut). Si le marché Polymarket demande
+    P(rate hike) ou P(rate hold), il faut inverser ou ajuster la sortie.
+    detect_macro_direction() analyse la question pour déterminer quoi mapper.
     """
 
     LOGIT_COEFFS = {
@@ -343,12 +347,66 @@ class MacroFedModel:
         "yield_curve":   +0.95,
     }
 
-    def logit_probability(self, macro_data: dict) -> float:
+    @staticmethod
+    def detect_macro_direction(question: str) -> str:
+        """
+        Analyse la question Polymarket pour déterminer ce qu'elle demande.
+        Returns: "cut", "hike", "hold", ou "unknown"
+        """
+        q = question.lower()
+        if any(kw in q for kw in ["rate cut", "cut rate", "lower rate", "reduce rate",
+                                    "decrease rate", "25bps cut", "50bps cut"]):
+            return "cut"
+        if any(kw in q for kw in ["rate hike", "hike rate", "raise rate", "increase rate",
+                                    "25bps hike", "50bps hike", "higher rate"]):
+            return "hike"
+        if any(kw in q for kw in ["hold", "unchanged", "no change", "pause",
+                                    "maintain rate", "keep rate"]):
+            return "hold"
+        return "unknown"
+
+    def logit_probability(self, macro_data: dict, question: str = "") -> float:
+        """
+        Calcule P(rate cut) via logit, puis ajuste selon ce que le marché demande.
+
+        Le logit est un modèle BINAIRE calibré sur P(cut). Il n'est fiable
+        que pour les questions sur les rate cuts. Pour les questions sur hike
+        ou hold, on applique un shrinkage fort vers 0.5 et on laisse
+        FedWatch (60% du poids) dominer l'ensemble macro.
+
+        - Si le marché demande P(cut) → retourne P(cut) directement
+        - Si le marché demande P(hike) → retourne 1 - P(cut) avec shrinkage 30%
+        - Si le marché demande P(hold) → shrinkage 70% vers 0.5
+        - Si unknown → shrinkage 80% vers 0.5
+        """
         z = self.LOGIT_COEFFS["intercept"]
         for key, coeff in self.LOGIT_COEFFS.items():
             if key != "intercept" and key in macro_data:
                 z += coeff * macro_data[key]
-        return float(expit(z))
+        p_cut = float(expit(z))
+
+        direction = self.detect_macro_direction(question)
+        if direction == "cut":
+            return p_cut
+        elif direction == "hike":
+            # Approximation : P(hike) ≈ 1 - P(cut), mais avec shrinkage
+            # car le logit ne modélise pas directement les hikes
+            p_hike_raw = 1.0 - p_cut
+            return 0.5 + (p_hike_raw - 0.5) * 0.7  # 30% shrinkage
+        elif direction == "hold":
+            # Le logit binaire n'est pas conçu pour le 3-way cut/hike/hold
+            # Shrinkage fort : on laisse FedWatch décider
+            p_hold_raw = 1.0 - abs(2 * p_cut - 1.0)  # max quand p_cut ≈ 0.5
+            return 0.5 + (p_hold_raw - 0.5) * 0.3  # 70% shrinkage
+        else:
+            log.warning("MacroFedModel: direction inconnue pour '%s', shrinkage vers 0.5", question[:60])
+            return 0.5 + (p_cut - 0.5) * 0.2  # 80% shrinkage
+
+    # Statistiques historiques de la pente 10Y-3M (FRED 1982-2025)
+    # Moyenne ~ +1.50%, σ ~ 1.20%
+    # Permet de convertir la pente en z-score au lieu d'un scaling arbitraire
+    SLOPE_HIST_MEAN = 0.015   # 1.50% = moyenne historique
+    SLOPE_HIST_STD  = 0.012   # 1.20% = écart-type historique
 
     def nelson_siegel_implied(
         self, maturities: np.ndarray, yields: np.ndarray
@@ -356,6 +414,12 @@ class MacroFedModel:
         """
         f(t) = β₀ + β₁×e^(-t/τ) + β₂×(t/τ)×e^(-t/τ)
         Pente de la courbe → signal politique monétaire.
+
+        FIX #5 : remplace le scaling arbitraire ×15/×5 par un z-score
+        normalisé sur la distribution historique de la pente 10Y-3M.
+        z > 0 → courbe plus pentue que la moyenne → dove → rate cut probable
+        z < 0 → courbe inversée → hawkish → rate cut improbable
+        sigmoid(z) donne une probabilité calibrée dans [0, 1].
         """
         def ns_curve(params, t):
             b0, b1, b2, tau = params
@@ -371,15 +435,21 @@ class MacroFedModel:
             b0, b1, b2, tau = result.x
             if tau <= 0:
                 return 0.5
-            # FIX: utiliser la pente réelle de la courbe fittée (10Y - 3M)
-            # au lieu de slope = -b1 qui perdait l'info de courbure β₂
+
             rate_short = ns_curve(result.x, 0.25)   # 3 mois
             rate_long  = ns_curve(result.x, 10.0)   # 10 ans
             slope = rate_long - rate_short
-            # Courbure (β₂) : signal additionnel sur attentes de taux futurs
-            curvature_signal = b2 * 5.0
-            combined = slope * 15.0 + curvature_signal
-            return float(expit(combined))
+
+            # Z-score de la pente par rapport à la distribution historique
+            z_slope = (slope - self.SLOPE_HIST_MEAN) / max(self.SLOPE_HIST_STD, 1e-6)
+
+            # Courbure (β₂) : z-score aussi, centré sur 0
+            # β₂ > 0 → "hump" → marché attend un changement de régime
+            # Contribution modeste : pondérée à 25% du signal total
+            z_curvature = b2 / max(abs(b2) + 0.01, 0.01) * 0.5  # normalisé [-0.5, +0.5]
+
+            z_combined = z_slope + 0.25 * z_curvature
+            return float(expit(z_combined))
         except Exception:
             return 0.5
 
@@ -387,8 +457,9 @@ class MacroFedModel:
         self,
         macro_data: dict,
         p_fedwatch: float,
+        question: str = "",
     ) -> dict:
-        p_logit = self.logit_probability(macro_data)
+        p_logit = self.logit_probability(macro_data, question)
 
         # Nelson-Siegel (optionnel si données disponibles)
         p_ns = 0.5
@@ -490,19 +561,28 @@ class EventModel:
 
 class BrierWeightedEnsemble:
     """
-    w_i = exp(-Brier_i) / S exp(-Brier_j)
+    w_i = exp(-Brier_i) / Σ exp(-Brier_j)
 
-    FIX Bug #2 : per-model Brier tracking via model_predictions table.
+    Les modèles les mieux calibrés reçoivent plus de poids.
+    Minimum 5 résolutions par modèle pour calculer son poids — sinon poids égaux.
+
+    FIX Bug #2 : utilise la table model_predictions pour calculer le Brier
+    individuel de chaque modèle (base_rate, quant, bayes_updated) au lieu
+    d'un seul Brier global réparti 1/3 - 1/3 - 1/3.
     """
 
-    MIN_SAMPLES = 5
+    MIN_SAMPLES = 5   # résolutions minimum pour pondérer un modèle
+    MIN_FOR_EXTREMIZE = 20  # résolutions minimum avant d'activer l'extremizing
 
-    def __init__(self, db_conn):
-        import sqlite3
-        self.conn = db_conn
+    def __init__(self, db_conn: sqlite3.Connection):
+        self.conn   = db_conn
         self.models = ["base_rate", "quant", "bayes_updated"]
 
-    def _get_per_model_brier(self, model_name, last_n=20):
+    def _get_per_model_brier(self, model_name: str, last_n: int = 20) -> tuple[float | None, int]:
+        """
+        Calcule le Brier score d'un modèle sur ses last_n dernières prédictions résolues.
+        Retourne (brier, n_samples) ou (None, 0) si pas assez de données.
+        """
         rows = self.conn.execute("""
             SELECT mp.p_predicted, mp.outcome
             FROM model_predictions mp
@@ -510,57 +590,100 @@ class BrierWeightedEnsemble:
             WHERE mp.model_name = ?
               AND mp.outcome IS NOT NULL
               AND t.status = 'closed'
-            ORDER BY t.exit_ts DESC LIMIT ?
+            ORDER BY t.exit_ts DESC
+            LIMIT ?
         """, (model_name, last_n)).fetchall()
+
         n = len(rows)
         if n < self.MIN_SAMPLES:
             return None, n
+
         brier = sum((p - o) ** 2 for p, o in rows) / n
         return brier, n
 
-    def compute_weights(self, last_n=20):
-        brier_scores = {}
-        n_samples = {}
+    def compute_weights(self, last_n: int = 20) -> dict[str, float]:
+        """
+        Calcule les poids Brier-weighted pour chaque modèle.
+        Modèles sans assez d'historique reçoivent le poids moyen des autres.
+        """
+        brier_scores: dict[str, float | None] = {}
+        n_samples: dict[str, int] = {}
+
         for model in self.models:
             b, n = self._get_per_model_brier(model, last_n)
             brier_scores[model] = b
             n_samples[model] = n
+
+        # Modèles avec assez de données
         calibrated = {m: b for m, b in brier_scores.items() if b is not None}
+
         if not calibrated:
+            # Aucun modèle n'a assez d'historique → poids égaux
             equal_w = 1.0 / len(self.models)
-            log.debug("BrierEnsemble: not enough history, equal weights")
+            log.debug("BrierEnsemble: pas assez d'historique, poids égaux (1/%d)", len(self.models))
             return {m: equal_w for m in self.models}
+
+        # exp(-Brier) pour chaque modèle calibré
         exp_weights = {m: float(np.exp(-b)) for m, b in calibrated.items()}
         total_exp = sum(exp_weights.values())
+
+        # Poids normalisés pour les modèles calibrés
         norm_weights = {m: w / total_exp for m, w in exp_weights.items()}
+
+        # Poids moyen pour les modèles non calibrés
         avg_weight = sum(norm_weights.values()) / len(norm_weights)
-        weights = {}
+
+        weights: dict[str, float] = {}
         for m in self.models:
-            weights[m] = norm_weights.get(m, avg_weight)
+            if m in norm_weights:
+                weights[m] = norm_weights[m]
+            else:
+                weights[m] = avg_weight
+
+        # Re-normaliser pour que Σ = 1
         total = sum(weights.values())
         weights = {m: w / total for m, w in weights.items()}
-        log.info("BrierEnsemble weights: %s (brier: %s, samples: %s)",
+
+        log.info(
+            "BrierEnsemble weights: %s  (brier: %s, samples: %s)",
             {m: f"{w:.3f}" for m, w in weights.items()},
             {m: f"{b:.4f}" if b is not None else "N/A" for m, b in brier_scores.items()},
-            n_samples)
+            n_samples,
+        )
         return weights
 
-    def combine(self, predictions_dict):
+    def is_calibrated(self) -> bool:
+        """True si au moins 2 modèles ont >= MIN_FOR_EXTREMIZE résolutions."""
+        calibrated_count = 0
+        for model in self.models:
+            _, n = self._get_per_model_brier(model, self.MIN_FOR_EXTREMIZE)
+            if n >= self.MIN_FOR_EXTREMIZE:
+                calibrated_count += 1
+        return calibrated_count >= 2
+
+    def combine(self, predictions_dict: dict[str, float]) -> dict:
         weights = self.compute_weights()
+        # Filtrer : ne pondérer que les modèles présents dans predictions_dict
         active_weights = {m: weights.get(m, 0) for m in predictions_dict}
         total_w = sum(active_weights.values())
         if total_w > 0:
             active_weights = {m: w / total_w for m, w in active_weights.items()}
-        p_ensemble = sum(active_weights.get(m, 0) * p for m, p in predictions_dict.items())
-        probs = list(predictions_dict.values())
+
+        p_ensemble = sum(
+            active_weights.get(m, 0) * p
+            for m, p in predictions_dict.items()
+        )
+        probs  = list(predictions_dict.values())
         spread = max(probs) - min(probs) if len(probs) > 1 else 0.0
         return {
-            "p_final": round(p_ensemble, 4),
+            "p_final":      round(p_ensemble, 4),
             "weights_used": active_weights,
             "model_spread": round(spread, 4),
-            "signal": ("fort" if spread < 0.10 else "moyen" if spread < 0.20 else "faible"),
+            "signal":       (
+                "fort"  if spread < 0.10 else
+                "moyen" if spread < 0.20 else "faible"
+            ),
         }
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -572,37 +695,62 @@ def final_decision(
     quant_result: Optional[dict],
     bayes_result: Optional[float],
     ensemble: dict,
+    brier_calibrated: bool = False,
 ) -> tuple[Optional[dict], str]:
     """
     Synthèse finale + extremizing adaptatif.
 
-    Règles d'extremizing :
-    - 3 sources convergentes (spread < 0.12) → α = 1.4
-    - 2 sources                              → α = 1.2
-    - 1 source                               → α = 1.0 (off)
+    FIX #2 : l'extremizing n'est appliqué que si le Brier ensemble est
+    calibré (≥ MIN_BRIER_FOR_EXTREMIZE trades résolus par modèle).
+    Sans calibration, amplifier les probabilités amplifie les erreurs.
+
+    FIX #3 : l'intervalle de confiance utilise min/max (enveloppe)
+    au lieu de la moyenne, pour refléter le vrai désaccord inter-modèles.
+
+    Règles d'extremizing (si calibré) :
+    - 2+ sources convergentes (spread < 0.12) → α = 1.3
+    - 2+ sources                              → α = 1.15
+    - 1 source ou non calibré                 → α = 1.0 (off)
     """
     if ensemble["signal"] == "faible":
         return None, "signal_trop_faible"
 
     p_raw     = ensemble["p_final"]
-    n_sources = sum(1 for r in [base_rate_result, quant_result, bayes_result]
+    n_sources = sum(1 for r in [quant_result, bayes_result]
                     if r is not None)
+    # base_rate compte comme source supplémentaire seulement s'il est
+    # dans l'ensemble (fallback quand pas de bayes_updated)
+    if base_rate_result and "base_rate" in ensemble.get("weights_used", {}):
+        n_sources += 1
 
-    if n_sources >= 3 and ensemble["model_spread"] < 0.12:
-        p_final = p_raw ** 1.4 / (p_raw ** 1.4 + (1 - p_raw) ** 1.4)
-    elif n_sources >= 2:
-        p_final = p_raw ** 1.2 / (p_raw ** 1.2 + (1 - p_raw) ** 1.2)
-    else:
-        p_final = p_raw
+    extremized = False
+    p_final = p_raw
+
+    if brier_calibrated and n_sources >= 2:
+        if ensemble["model_spread"] < 0.12:
+            alpha = 1.3
+        else:
+            alpha = 1.15
+        p_final = p_raw ** alpha / (p_raw ** alpha + (1 - p_raw) ** alpha)
+        extremized = True
+        log.debug(f"Extremizing: α={alpha}, p_raw={p_raw:.4f} → p_final={p_final:.4f}")
+    elif not brier_calibrated:
+        log.debug("Extremizing OFF: Brier non calibré, p_final = p_raw")
 
     p_final = max(0.01, min(0.99, p_final))
 
-    # Intervalles
-    intervals = [r["interval"] for r in [base_rate_result, quant_result]
-                 if r and "interval" in r]
-    if intervals:
-        low  = np.mean([i[0] for i in intervals])
-        high = np.mean([i[1] for i in intervals])
+    # FIX #3 : Intervalles — enveloppe (min/max) au lieu de moyenne
+    # Reflète le vrai niveau de désaccord entre modèles
+    all_lows = []
+    all_highs = []
+    for r in [base_rate_result, quant_result]:
+        if r and "interval" in r:
+            all_lows.append(r["interval"][0])
+            all_highs.append(r["interval"][1])
+
+    if all_lows and all_highs:
+        low  = min(all_lows)
+        high = max(all_highs)
     else:
         low  = p_final - 0.15
         high = p_final + 0.15
@@ -617,7 +765,7 @@ def final_decision(
         "interval":       (round(low, 4), round(high, 4)),
         "uncertainty":    round(uncertainty, 4),
         "n_sources":      n_sources,
-        "extremized":     n_sources >= 2,
+        "extremized":     extremized,
         "signal_strength": (
             "fort"  if uncertainty < 0.15 else
             "moyen" if uncertainty < 0.25 else "faible"
@@ -631,19 +779,51 @@ def final_decision(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def route_to_model(question: str) -> str:
-    """Sélectionne automatiquement le modèle adapté selon la catégorie."""
-    q = question.lower()
-    crypto_kw = ["bitcoin", "btc", "eth", "ethereum", "solana", "sol",
-                 "crypto", "price", "100k", "120k", "150k", "200k"]
-    fed_kw    = ["fed", "federal reserve", "interest rate", "fomc",
-                 "rate cut", "rate hike", "bps", "25bps", "50bps"]
+    """
+    Sélectionne le modèle adapté selon la NATURE du marché.
 
-    if any(kw in q for kw in crypto_kw):
+    FIX #6 : classification en 2 passes —
+      1. Détecte si c'est un marché de PRIX crypto (Black-Scholes pertinent)
+         vs un marché ÉVÉNEMENTIEL lié à la crypto (ETF, régulation, etc.)
+      2. Détecte les marchés de politique monétaire (macro)
+      3. Fallback → event
+
+    Principe : Black-Scholes n'a de sens que pour "Will X reach price Y by date Z?"
+    Pas pour "Will X ETF be approved?" même si X = Bitcoin.
+    """
+    q = question.lower()
+
+    # ── Marchés événementiels (priorité haute — override crypto keywords) ──
+    event_overrides = [
+        "approve", "approval", "ban", "regulation", "congress", "senate",
+        "law", "bill", "vote", "elect", "resign", "impeach", "indict",
+        "etf", "sec ", "cftc", "executive order", "strategic reserve",
+        "war", "ceasefire", "invasion", "sanction", "tariff", "treaty",
+    ]
+    if any(kw in q for kw in event_overrides):
+        # Sauf si c'est un vrai prix target caché dedans
+        price_patterns = ["above", "below", "reach", "hit", "exceed", "price"]
+        if not any(pp in q for pp in price_patterns):
+            return "event"
+
+    # ── Marchés crypto PRIX (Black-Scholes a du sens) ──
+    crypto_price_kw = ["bitcoin", "btc", "eth", "ethereum", "solana", "sol", "crypto"]
+    price_kw = ["price", "above", "below", "reach", "hit", "exceed",
+                "100k", "120k", "150k", "200k", "50k", "75k"]
+    has_crypto = any(kw in q for kw in crypto_price_kw)
+    has_price  = any(kw in q for kw in price_kw)
+    if has_crypto and has_price:
         return "crypto"
-    elif any(kw in q for kw in fed_kw):
+
+    # ── Marchés macro/Fed ──
+    fed_kw = ["fed", "federal reserve", "interest rate", "fomc",
+              "rate cut", "rate hike", "bps", "25bps", "50bps",
+              "monetary policy", "inflation target", "quantitative"]
+    if any(kw in q for kw in fed_kw):
         return "macro"
-    else:
-        return "event"
+
+    # ── Fallback ──
+    return "event"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -718,7 +898,7 @@ class ProbabilisticScorer:
             macro.setdefault("gdp_growth", 2.8)
             macro.setdefault("fed_funds_rate", 5.25)
             macro.setdefault("yield_curve", -0.20)
-            quant_result = self.macro.get_probability(macro, ctx.p_fedwatch)
+            quant_result = self.macro.get_probability(macro, ctx.p_fedwatch, ctx.question)
 
         else:
             # EventModel — toujours disponible
@@ -729,46 +909,70 @@ class ProbabilisticScorer:
             )
 
         # ── ÉTAPE 3 : Bayes update sur signaux news ────────────────────────
-        # LRs issus de LR_PRIOR (table calibrée CrucixRouter) — pas de valeurs hardcodées
+        # FIX #1+#4 : part du quant_result (pas du base_rate pour éviter le
+        #   double-comptage dans l'ensemble) + applique temporal decay et cap ±15%
+        #   comme le fait CrucixRouter pour les positions ouvertes.
         bayes_result = None
         if ctx.news_signals:
-            p = base_rate_result["p_base"]
+            # Point de départ = quant (information nouvelle), pas base_rate
+            p = quant_result["p_model"] if quant_result else base_rate_result["p_base"]
+            now = datetime.now(timezone.utc)
             for signal in ctx.news_signals:
-                lr_bull, _ = LR_PRIOR.get(signal.source_id, (1.20, 0.833))
-                lr = lr_bull  # excès de LR par rapport à 1, direction gérée séparément
+                lr_bull, lr_bear = LR_PRIOR.get(signal.source_id, (1.20, 0.833))
                 try:
                     dir_value = signal.direction.value if signal.direction else None
                 except AttributeError:
                     dir_value = None
                 if dir_value not in ("bullish", "bearish"):
                     continue
+                # Temporal decay : LR_eff = 1 + (LR - 1) × exp(-λ × age_min)
+                age_min = max(0.0, (now - signal.timestamp).total_seconds() / 60.0)
+                decay = math.exp(-0.0025 * age_min)
                 if dir_value == "bullish":
-                    odds = p / (1 - p) * lr
+                    lr_eff = 1.0 + (lr_bull - 1.0) * decay
+                    odds = p / (1 - p) * lr_eff
                 else:
-                    odds = p / (1 - p) / lr
-                p = max(0.02, min(0.98, odds / (1 + odds)))
+                    lr_eff = 1.0 + (lr_bear - 1.0) * decay  # lr_bear < 1
+                    odds = p / (1 - p) * lr_eff
+                p_new = max(0.02, min(0.98, odds / (1 + odds)))
+                # Hard cap ±15% par source unique
+                delta = p_new - p
+                if abs(delta) > 0.15:
+                    p_new = p + math.copysign(0.15, delta)
+                p = p_new
             bayes_result = round(p, 4)
 
         # ── ÉTAPE 4 : Ensemble pondéré par Brier ──────────────────────────
+        # FIX #1 : On n'inclut PAS base_rate séparément car bayes_updated
+        # en dérive déjà (via quant qui absorbe l'outside view).
+        # L'ensemble combine 2 modèles *indépendants* :
+        #   - quant : signal quantitatif pur (crypto/macro/event)
+        #   - bayes_updated : quant + news signals avec decay
+        # Si bayes_updated n'existe pas (aucun signal news), on utilise quant + base_rate
+        # comme fallback pour avoir au moins 2 modèles.
         preds: dict[str, float] = {}
-        if base_rate_result:
-            preds["base_rate"] = base_rate_result["p_base"]
         if quant_result:
             preds["quant"] = quant_result["p_model"]
         if bayes_result is not None:
             preds["bayes_updated"] = bayes_result
+        # Fallback : si pas de news signals, ajouter base_rate comme 2ème vue
+        if "bayes_updated" not in preds and base_rate_result:
+            preds["base_rate"] = base_rate_result["p_base"]
 
         if not preds:
             return {"tradeable": False, "reason": "no_models_available"}
 
-        # Sauvegarder les predictions per-model pour le Brier tracking
+        # Sauvegarder les prédictions per-model pour le Brier tracking
+        # (sera enregistré en DB par main.py après ouverture du trade)
         model_predictions_snapshot = dict(preds)
 
         ens = self.ensemble.combine(preds)
 
         # ── ÉTAPE 5 : Décision finale + extremizing ────────────────────────
+        brier_ok = self.ensemble.is_calibrated()
         result, reason = final_decision(
-            base_rate_result, quant_result, bayes_result, ens
+            base_rate_result, quant_result, bayes_result, ens,
+            brier_calibrated=brier_ok,
         )
 
         if result is None:
