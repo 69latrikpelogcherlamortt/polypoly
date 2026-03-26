@@ -29,6 +29,87 @@ S1_LONGSHOT_THRESHOLD = S1_PRICE_LONG_MAX
 
 log = logging.getLogger("scanner")
 
+# ── Gamma API category normalization ─────────────────────────────────────────
+# Gamma renvoie des slugs comme "US-current-affairs", "Science" ou "" selon le
+# marché.  On mappe vers les valeurs attendues par S2_CATEGORIES.
+_GAMMA_CAT_MAP: dict[str, str] = {
+    "us-current-affairs": "politics",
+    "current-affairs":    "politics",
+    "politics":           "politics",
+    "geopolitics":        "politics",
+    "world":              "politics",
+    "economics":          "economics",
+    "economy":            "economics",
+    "finance":            "finance",
+    "financial-markets":  "finance",
+    "stocks":             "finance",
+    "crypto":             "crypto",
+    "cryptocurrency":     "crypto",
+    "defi":               "crypto",
+    "sports":             "sports",
+    "soccer":             "sports",
+    "football":           "sports",
+    "basketball":         "sports",
+    "tennis":             "sports",
+    "mma":                "sports",
+    "baseball":           "sports",
+    "esports":            "sports",
+    "tech":               "tech",
+    "technology":         "tech",
+    "science":            "tech",
+    "ai":                 "tech",
+}
+
+# Mots-clés de fallback sur la question quand la catégorie API est vide/inconnue
+_KEYWORD_MAP: list[tuple[tuple[str, ...], str]] = [
+    # Finance / Economie
+    (("fed", "federal reserve", "rate cut", "rate hike", "interest rate",
+      "inflation", "cpi", "gdp", "recession", "fomc", "ecb", "boe"), "economics"),
+    # Finance marchés
+    (("bitcoin", "btc", "eth", "ethereum", "crypto", "solana", "doge",
+      "coinbase", "binance"), "crypto"),
+    (("stock", "s&p", "nasdaq", "dow", "ipo", "earnings", "market cap",
+      "share price", "nyse"), "finance"),
+    # Politique
+    (("president", "election", "senate", "congress", "vote", "democrat",
+      "republican", "trump", "biden", "harris", "modi", "macron", "chancellor",
+      "prime minister", "iran", "netanyahu", "ceasefire", "ukraine",
+      "russia", "sanctions", "nato"), "politics"),
+    # Sports
+    (("goal", "win", "champion", "league", "nfl", "nba", "mlb", "fifa",
+      "world cup", "atletico", "arsenal", "barcelona", "manchester", "lakers",
+      "warriors", "super bowl", "wimbledon", "ufc", "playoff"), "sports"),
+    # Tech
+    (("openai", "gpt", "llm", "model", "nvidia", "apple", "google", "microsoft",
+      "meta", "spacex", "launch", "satellite"), "tech"),
+]
+
+
+def _normalize_category(raw_cat: str, question: str) -> str:
+    """
+    Normalise la catégorie d'un marché Polymarket.
+
+    1. Essaie la map directe sur le slug API.
+    2. Si inconnu/vide, parcourt les mots-clés de la question.
+    3. Retourne "" si aucun match (sera filtré par S2 si nécessaire).
+    """
+    slug = raw_cat.strip().lower()
+    if slug in _GAMMA_CAT_MAP:
+        return _GAMMA_CAT_MAP[slug]
+
+    # Cas où le slug contient un préfixe (ex: "us-current-affairs")
+    for key, val in _GAMMA_CAT_MAP.items():
+        if key in slug:
+            return val
+
+    # Fallback keyword sur la question
+    q_lower = question.lower() if question else ""
+    for keywords, cat in _KEYWORD_MAP:
+        if any(kw in q_lower for kw in keywords):
+            return cat
+
+    return slug  # conserve la valeur brute si rien ne matche
+
 
 class MarketScanner:
     """
@@ -189,7 +270,7 @@ class MarketScanner:
                 "volume_total": vol_total,
                 "liquidity": float(m.get("liquidity", 0) or 0),
                 "days_to_res": days,
-                "category": m.get("category", "").lower(),
+                "category": _normalize_category(m.get("category", ""), m.get("question", "")),
                 "resolution_source": m.get("resolutionSource", ""),
                 "condition_id": m.get("conditionId"),
                 "end_date": m.get("endDate"),

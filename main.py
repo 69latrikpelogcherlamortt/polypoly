@@ -302,6 +302,12 @@ class TradingBot:
         ).fetchone()
         daily_pnl = round(nav_now - float(last[0]), 4) if last else 0.0
         self.trade_repo.record_nav(nav=nav_now, daily_pnl=daily_pnl)
+        # Fix #12 — persister le snapshot complet du portefeuille
+        try:
+            state = self.metrics.build_portfolio_state(self.bankroll, positions)
+            self.trade_repo.save_portfolio_snapshot(state)
+        except Exception as _snap_err:  # noqa: BLE001
+            log.warning("save_portfolio_snapshot failed: %s", _snap_err)
 
     def _load_returns_history(self) -> list[float]:
         rows = self.trading_conn.execute(

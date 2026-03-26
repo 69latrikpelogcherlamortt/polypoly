@@ -538,22 +538,54 @@ class EventModel:
         - Market price anchor : le prix Polymarket EST de l'information
           (efficience partielle). Ancrage léger w=0.3 pour ne pas être circulaire.
         - Temps restant : si < 3j, augmenter le poids des sources live
+
+        FIX #10 : no_quant_signal guard + NameError fix
+        - Sans signal externe (Kalshi/Fermi), le base_rate=0.5 par défaut
+          créait un faux edge si p_market était éloigné de 0.5 (ex: Fed à 1.3%).
+        - Solution : si aucun signal externe, retourner p_market comme estimateur
+          (hypothèse d'efficience partielle — la foule a agrégé l'info disponible).
+          → edge = 0, sauf si LLM ou news pushent ensuite dans le pipeline.
+        - Corrige aussi le NameError "n is not defined" dans le return dict.
         """
+        # Détection : a-t-on un signal quantitatif externe indépendant ?
+        has_kalshi = p_kalshi is not None
+        has_fermi  = bool(sub_questions)
+        has_real_signal = has_kalshi or has_fermi
+
         sources = [("base_rate", ref_class_result["p_base"], 1.0)]
 
-        if p_kalshi is not None:
+        if has_kalshi:
             sources.append(("kalshi", p_kalshi, 1.5))
 
-        if sub_questions:
+        if has_fermi:
             p_fermi = self.fermi_decomposition(sub_questions)
             if p_fermi:
                 sources.append(("fermi", p_fermi, 1.2))
 
-        # FIX #5 : market price anchor (léger, pour ne pas être circulaire)
+        # Market price anchor (léger, w=0.3 pour ne pas être circulaire)
         # Le marché Polymarket contient de l'information agrégée — l'ignorer
         # complètement est aussi une erreur. Poids faible = 0.3
         if p_market is not None and 0.05 < p_market < 0.95:
             sources.append(("market_anchor", p_market, 0.3))
+
+        # FIX #10 : Sans signal externe, ne pas polluer l'ensemble avec le
+        # base_rate=0.5 (DB vide) — retourner le prix marché comme prior neutre.
+        # Le pipeline scoring (LLM, news) peut encore créer un edge par-dessus.
+        if not has_real_signal:
+            p_prior = p_market if p_market is not None else ref_class_result["p_base"]
+            log.debug(
+                "EventModel: pas de signal externe (Kalshi/Fermi) — "
+                "prior neutre = prix marché %.3f", p_prior
+            )
+            return {
+                "p_model":         round(p_prior, 4),
+                "p_raw":           round(p_prior, 4),
+                "sources":         sources,
+                "extremized":      False,
+                "interval":        ref_class_result["interval"],
+                "model":           "event_ensemble",
+                "no_quant_signal": True,
+            }
 
         # FIX #5 : si proche de l'expiration, les sources live (Kalshi, Fermi)
         # sont plus fiables que le base_rate historique
@@ -572,7 +604,7 @@ class EventModel:
             "p_model":   round(p_final, 4),
             "p_raw":     round(p_ensemble, 4),
             "sources":   sources,
-            "extremized": n >= 2,
+            "extremized": len(sources) >= 2,  # FIX #10 : était "n >= 2" (NameError)
             "interval":  ref_class_result["interval"],
             "model":     "event_ensemble",
         }
@@ -1058,11 +1090,14 @@ class ProbabilisticScorer:
                     f"MacroFedModel: données live manquantes {missing}, "
                     "utilisation des fallbacks statiques — configurer BLS_API_KEY pour données live"
                 )
-            macro.setdefault("cpi_yoy", 3.2)
-            macro.setdefault("unemployment", 4.1)
-            macro.setdefault("gdp_growth", 2.8)
-            macro.setdefault("fed_funds_rate", 5.25)
-            macro.setdefault("yield_curve", -0.20)
+            # Fallbacks calibrés Mars 2026 (FRED comme source de référence)
+            # Fed a coupé 100bps depuis le pic 5.25-5.50% (sept 2024 → mars 2026)
+            # Yield curve s'est normalisée (inversion 10Y-3M levée fin 2025)
+            macro.setdefault("cpi_yoy", 2.9)          # Core PCE ~2.7%, CPI ~3.0%
+            macro.setdefault("unemployment", 4.2)     # BLS : 4.2% (légère hausse)
+            macro.setdefault("gdp_growth", 2.3)       # PIB US réel Q4 2025
+            macro.setdefault("fed_funds_rate", 4.25)  # EFFR après 4 cuts (→4.25%)
+            macro.setdefault("yield_curve", 0.15)     # 10Y-3M normalisée (+15bps)
             quant_result = self.macro.get_probability(macro, ctx.p_fedwatch, ctx.question)
 
         else:
@@ -1168,7 +1203,11 @@ class ProbabilisticScorer:
                 log.info(f"Superforce LLM: p_raw={p_llm:.3f} conf={confidence} → shrunk={p_llm_shrunk:.3f}")
 
         # Slot 3 : base_rate — uniquement comme fallback si < 2 sources
-        if len(preds) < 2 and base_rate_result:
+        # FIX #10 : ne pas ajouter le base_rate quand EventModel n'a pas de
+        # signal réel (no_quant_signal=True). Dans ce cas quant_adjusted = p_market
+        # et ajouter base_rate=0.5 diluerait le prior neutre vers un faux edge.
+        quant_has_real_signal = quant_result and not quant_result.get("no_quant_signal")
+        if len(preds) < 2 and base_rate_result and quant_has_real_signal:
             preds["base_rate"] = base_rate_result["p_base"]
 
         if not preds:

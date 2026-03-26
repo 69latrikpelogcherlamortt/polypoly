@@ -34,6 +34,8 @@ from core.config import (
     NITTER_INSTANCES, TWITTER_ACCOUNTS_TIER1, TWITTER_ACCOUNTS_CRYPTO,
     TWITTER_ACCOUNTS_POLY, TWEET_BLACKLIST,
     CME_FEDWATCH_URL, BINANCE_WS,
+    BBC_FEEDS, CNBC_FEEDS, MARKETWATCH_FEEDS, NPR_FEEDS,
+    GDELT_API_BASE, METACULUS_API_BASE,
 )
 from signals.crucix_router import (
     CrucixAlert, AlertCategory, SignalDirection,
@@ -373,20 +375,39 @@ class RSSNewsSource:
         return alerts
 
     async def fetch_reuters(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
+        """
+        Reuters RSS mort depuis 2024 (DNS failure sur VPS).
+        Remplacé par BBC + CNBC + MarketWatch + NPR — même qualité Tier-1.
+        """
         alerts = []
-        for url in REUTERS_FEEDS:
+        # BBC Business + US/Canada
+        for url in BBC_FEEDS:
             alerts.extend(
-                await self.fetch_rss(session, url, "reuters_rss", AlertCategory.NEWS_TIER1)
+                await self.fetch_rss(session, url, "bbc_news", AlertCategory.NEWS_TIER1)
+            )
+        # CNBC — news financières US
+        for url in CNBC_FEEDS:
+            alerts.extend(
+                await self.fetch_rss(session, url, "cnbc_news", AlertCategory.NEWS_TIER1)
+            )
+        # MarketWatch — marchés et macro
+        for url in MARKETWATCH_FEEDS:
+            alerts.extend(
+                await self.fetch_rss(session, url, "marketwatch", AlertCategory.NEWS_TIER1)
+            )
+        # NPR Economy — couverture généraliste de qualité
+        for url in NPR_FEEDS:
+            alerts.extend(
+                await self.fetch_rss(session, url, "npr_news", AlertCategory.NEWS_TIER2)
             )
         return alerts
 
     async def fetch_ap(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
-        alerts = []
-        for url in AP_FEEDS:
-            alerts.extend(
-                await self.fetch_rss(session, url, "ap_news", AlertCategory.NEWS_TIER1)
-            )
-        return alerts
+        """
+        AP News ne sert plus de RSS public valide depuis 2023.
+        Désactivé — couverture assurée par BBC/CNBC/MarketWatch.
+        """
+        return []
 
     async def fetch_fed_gov(self, session: aiohttp.ClientSession) -> list[CrucixAlert]:
         return await self.fetch_rss(
@@ -471,6 +492,238 @@ class GoogleNewsSource:
                 if not _cache.is_duplicate(alert):
                     alerts.append(alert)
         return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5B. GDELT PROJECT — News globales temps réel, sans auth
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GDELTNewsSource:
+    """
+    GDELT Project — monitore 100k+ sources d'information mondiales.
+    API gratuite, sans auth, latence ~15 minutes.
+
+    Deux usages :
+      • fetch_general()    → alertes macro/crypto/politique (collect_all)
+      • fetch_for_market() → news spécifiques à un candidat (collect_for_market)
+    """
+
+    # Requêtes générales pour le cycle collect_all
+    GENERAL_QUERIES = [
+        "federal reserve interest rate decision",
+        "bitcoin ethereum cryptocurrency price",
+        "us election presidential political",
+        "tariff trade war sanctions economic",
+        "inflation cpi unemployment jobs",
+    ]
+
+    async def _fetch_query(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        category: AlertCategory,
+        magnitude: float = 0.42,
+        max_items: int = 15,
+        timespan: str = "24h",
+    ) -> list[CrucixAlert]:
+        try:
+            async with session.get(
+                GDELT_API_BASE,
+                params={
+                    "query":      query,
+                    "mode":       "artlist",
+                    "format":     "json",
+                    "maxrecords": min(max_items, 25),
+                    "timespan":   timespan,
+                    "sort":       "DateDesc",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("GDELT rate limited")
+                    return []
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.debug(f"GDELT fetch ({query[:40]}): {e}")
+            return []
+
+        rss = RSSNewsSource()
+        alerts = []
+        for art in (data.get("articles") or [])[:max_items]:
+            title = (art.get("title") or "").strip()
+            if not title:
+                continue
+            text = title.lower()
+            direction = rss._infer_direction(text)
+            if direction == SignalDirection.UNKNOWN:
+                continue
+
+            seendate = art.get("seendate", "")
+            try:
+                ts = datetime.strptime(seendate, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            except Exception:
+                ts = datetime.now(timezone.utc)
+
+            alert = CrucixAlert(
+                source_id       = "gdelt_news",
+                category        = category,
+                raw_text        = title,
+                direction       = direction,
+                magnitude       = magnitude,
+                market_keywords = [w for w in query.lower().split() if len(w) > 3][:8],
+                timestamp       = ts,
+                source_url      = art.get("url", ""),
+            )
+            if not _cache.is_duplicate(alert):
+                alerts.append(alert)
+
+        return alerts
+
+    async def fetch_general(
+        self, session: aiohttp.ClientSession
+    ) -> list[CrucixAlert]:
+        """Alertes générales macro/crypto/politique — pour collect_all."""
+        alerts = []
+        for query in self.GENERAL_QUERIES:
+            alerts.extend(
+                await self._fetch_query(session, query, AlertCategory.NEWS_TIER2)
+            )
+        return alerts
+
+    async def fetch_for_market(
+        self,
+        session: aiohttp.ClientSession,
+        question: str,
+        max_items: int = 10,
+    ) -> list[CrucixAlert]:
+        """News spécifiques pour un marché candidat — pour collect_for_market."""
+        keywords = self._extract_keywords(question)
+        query = " ".join(keywords[:6])
+        if not query.strip():
+            return []
+        return await self._fetch_query(
+            session, query, AlertCategory.NEWS_TIER2,
+            magnitude=0.45, max_items=max_items, timespan="48h",
+        )
+
+    @staticmethod
+    def _extract_keywords(question: str) -> list[str]:
+        """Extrait les mots-clés pertinents d'une question Polymarket."""
+        stopwords = {
+            "will", "be", "the", "a", "an", "of", "in", "to", "at", "by",
+            "for", "on", "is", "was", "are", "were", "or", "and", "any",
+            "this", "that", "it", "he", "she", "we", "they", "have", "has",
+            "before", "end", "above", "below", "more", "less", "than", "year",
+            "month", "day", "2025", "2026", "2027", "first", "last", "next",
+        }
+        words = re.sub(r"[^\w\s]", " ", question.lower()).split()
+        return [w for w in words if w not in stopwords and len(w) > 2]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5C. METACULUS — Cross-référence marchés prédictifs académiques
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MetaculusSource:
+    """
+    Metaculus — base de données de marchés prédictifs académiques.
+    API publique sans authentification pour la lecture.
+
+    Principe identique à KalshiSource : si la prédiction Metaculus
+    diverge de >5% de Polymarket, c'est un signal fort.
+    """
+
+    async def check_divergence(
+        self,
+        session: aiohttp.ClientSession,
+        poly_price: float,
+        market_question: str,
+    ) -> Optional[CrucixAlert]:
+        """
+        Cherche la question Metaculus la plus similaire.
+        Divergence > 5% → signal directionnel.
+        """
+        # Utiliser les 7 premiers mots comme query (limiter le bruit)
+        keywords = " ".join(market_question.split()[:7])
+
+        try:
+            async with session.get(
+                METACULUS_API_BASE,
+                params={
+                    "search":   keywords,
+                    "status":   "open",
+                    "type":     "forecast",
+                    "order_by": "-activity",
+                    "limit":    5,
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept":     "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("Metaculus rate limited")
+                    return None
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.debug(f"Metaculus ({keywords[:40]}): {e}")
+            return None
+
+        results = data.get("results", [])
+        if not results:
+            return None
+
+        best = results[0]
+        community_pred = best.get("community_prediction") or {}
+
+        # Format Metaculus : {"q2": {"prediction": 0.XX}} ou {"prediction": 0.XX}
+        p_meta: Optional[float] = None
+        if isinstance(community_pred, dict):
+            if "q2" in community_pred:
+                p_meta = community_pred["q2"].get("prediction")
+            elif "prediction" in community_pred:
+                p_meta = community_pred.get("prediction")
+
+        if p_meta is None or not (0.01 <= float(p_meta) <= 0.99):
+            return None
+
+        p_meta = float(p_meta)
+        divergence = p_meta - poly_price
+        if abs(divergence) < 0.05:  # seuil : même que Kalshi
+            return None
+
+        direction = (
+            SignalDirection.BULLISH if divergence > 0
+            else SignalDirection.BEARISH
+        )
+        title = best.get("title", "")
+        q_id  = best.get("id", "")
+
+        raw_text = (
+            f"Metaculus '{title[:80]}' → {p_meta:.1%} "
+            f"vs Poly {poly_price:.1%} Δ={divergence:+.1%}"
+        )
+
+        return CrucixAlert(
+            source_id       = "metaculus",
+            category        = AlertCategory.PREDICTION_MKT,
+            raw_text        = raw_text,
+            direction       = direction,
+            magnitude       = min(0.85, abs(divergence) * 3),
+            market_keywords = market_question.lower().split()[:8],
+            source_url      = f"https://www.metaculus.com/questions/{q_id}/",
+            entities={
+                "p_metaculus":  p_meta,
+                "poly_price":   poly_price,
+                "divergence":   divergence,
+                "question":     title,
+                "quantitative": True,
+            },
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -957,6 +1210,8 @@ class SignalAggregator:
         self.deribit     = DeribitSource()
         self.rss         = RSSNewsSource()
         self.google      = GoogleNewsSource()
+        self.gdelt       = GDELTNewsSource()
+        self.metaculus   = MetaculusSource()
         self.kalshi      = KalshiSource()
         self.poly_act    = PolymarketActivitySource()
         self.nitter      = NitterSource()
@@ -1010,17 +1265,27 @@ class SignalAggregator:
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"Deribit error: {e}")
 
-        # Reuters + AP — toutes les 5 minutes
+        # BBC + CNBC + MarketWatch + NPR + Fed.gov — toutes les 5 minutes
+        # (Reuters/AP désactivés : DNS mort / XML cassé)
         if self._should_fetch("rss", 300):
             try:
-                r_alerts = await self.rss.fetch_reuters(self.session)
-                a_alerts = await self.rss.fetch_ap(self.session)
+                r_alerts = await self.rss.fetch_reuters(self.session)   # → BBC+CNBC+MktWatch+NPR
                 f_alerts = await self.rss.fetch_fed_gov(self.session)
-                alerts.extend(r_alerts + a_alerts + f_alerts)
-                log.info(f"RSS: {len(r_alerts)+len(a_alerts)+len(f_alerts)} alertes")
+                alerts.extend(r_alerts + f_alerts)
+                log.info(f"RSS (BBC/CNBC/MarketWatch/NPR/Fed): {len(r_alerts)+len(f_alerts)} alertes")
                 self._mark_fetched("rss")
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
                 log.error(f"RSS error: {e}")
+
+        # GDELT — news globales toutes les 10 minutes
+        if self._should_fetch("gdelt", 600):
+            try:
+                new = await self.gdelt.fetch_general(self.session)
+                alerts.extend(new)
+                log.info(f"GDELT général: {len(new)} alertes")
+                self._mark_fetched("gdelt")
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, json.JSONDecodeError) as e:
+                log.error(f"GDELT error: {e}")
 
         # Twitter/Nitter — toutes les 10 minutes
         if self._should_fetch("nitter", 600):
@@ -1065,10 +1330,25 @@ class SignalAggregator:
         """
         Collecte les signaux spécifiques pour un marché candidat
         (appelé lors du scoring initial).
+
+        Sources (par ordre d'importance) :
+          1. GDELT — recherche news globales sur la question (free, rapide)
+          2. Google News RSS — redondant avec GDELT mais utile comme filet
+          3. Kalshi cross-check — cross-plateforme prédictif
+          4. Metaculus — cross-plateforme prédictif académique
         """
         alerts: list[CrucixAlert] = []
 
-        # Google News
+        # GDELT — news spécifiques au marché (source principale)
+        try:
+            gdelt_alerts = await self.gdelt.fetch_for_market(self.session, question)
+            alerts.extend(gdelt_alerts)
+            if gdelt_alerts:
+                log.info(f"GDELT pour marché ({question[:40]}...): {len(gdelt_alerts)} alertes")
+        except Exception as e:
+            log.debug(f"GDELT for market: {e}")
+
+        # Google News RSS (filet de sécurité — peut être lent ou rate-limited)
         try:
             alerts.extend(await self.google.fetch_for_market(self.session, question))
         except Exception as e:
@@ -1079,7 +1359,21 @@ class SignalAggregator:
             k_alert = await self.kalshi.check_divergence(self.session, price, question, keywords)
             if k_alert:
                 alerts.append(k_alert)
+                log.info(f"Kalshi divergence: {k_alert.raw_text[:80]}")
         except Exception as e:
             log.debug(f"Kalshi check: {e}")
 
+        # Metaculus cross-check (marchés prédictifs académiques)
+        try:
+            m_alert = await self.metaculus.check_divergence(self.session, price, question)
+            if m_alert:
+                alerts.append(m_alert)
+                log.info(f"Metaculus divergence: {m_alert.raw_text[:80]}")
+        except Exception as e:
+            log.debug(f"Metaculus check: {e}")
+
+        log.info(
+            f"collect_for_market '{question[:50]}...' → {len(alerts)} signaux "
+            f"(gdelt+google+kalshi+metaculus)"
+        )
         return alerts

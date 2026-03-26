@@ -78,15 +78,37 @@ CME_FEDWATCH_URL = "https://www.cmegroup.com/CmeWS/mvc/GetFedWatch/ProbHistorica
 # Deribit API v2
 DERIBIT_BASE    = "https://www.deribit.com/api/v2/public"
 
-# Reuters / AP News RSS
-REUTERS_FEEDS   = [
-    "https://feeds.reuters.com/reuters/topNews",
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/politicsNews",
+# Reuters — URLs mortes (DNS failure depuis 2024) — laissé vide, remplacé par BBC/CNBC/MktWatch
+REUTERS_FEEDS   = []
+
+# AP News — URL corrigée (ancien apf-topnews = HTML, pas XML)
+AP_FEEDS = []  # AP ne sert plus de RSS public depuis 2023
+
+# ── Remplaçants Tier-1 (BBC + CNBC + MarketWatch + NPR) ──────────────────
+# Tous publics, pas d'auth, XML RSS valide, stables
+BBC_FEEDS = [
+    "http://feeds.bbci.co.uk/news/business/rss.xml",
+    "http://feeds.bbci.co.uk/news/world/us-canada/rss.xml",
 ]
-AP_FEEDS = [
-    "https://apnews.com/apf-topnews",
+CNBC_FEEDS = [
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664",
 ]
+MARKETWATCH_FEEDS = [
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://feeds.marketwatch.com/marketwatch/realtimeheadlines/",
+]
+NPR_FEEDS = [
+    "https://feeds.npr.org/1001/rss.xml",   # Top stories
+    "https://feeds.npr.org/1006/rss.xml",   # Economy
+]
+
+# GDELT Project — recherche news globale temps réel, gratuit, sans auth
+# Couverture : 100k+ sources, 65+ langues, latence ~15min
+GDELT_API_BASE = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+# Metaculus — marchés prédictifs académiques, API publique sans auth
+METACULUS_API_BASE = "https://www.metaculus.com/api2/questions/"
 
 # Google News RSS
 GOOGLE_NEWS_BASE = "https://news.google.com/rss/search"
@@ -297,12 +319,18 @@ UNCERTAINTY_MAX = 0.25     # skip si intervalle de confiance > 25%
 # ═══════════════════════════════════════════════════════════════════════════
 
 MARKET_BLACKLIST_KEYWORDS = [
-    "most", "best", "worst", "favorite", "popular",
-    "who will win the most", "predict", "guess", "elon",
-    "trump says", "viral",
+    # Marchés trop subjectifs / sans résolution objective
+    "most popular", "best of", "worst of", "favorite",
+    "who will win the most", "guess",
+    "viral",
+    # Note: "predict", "elon", "trump" retirés — trop larges,
+    # filtrent des marchés politiques/crypto légitimes.
 ]
 MARKET_BLACKLIST_SOURCES = [
-    "admin", "polymarket", "discretion", "panel",
+    # "polymarket" retiré — en 2026 la plupart des marchés ont "polymarket"
+    # dans leur resolutionSource (ex: "Polymarket resolution committee").
+    # Garder uniquement les sources vraiment discrétionnaires/opaques.
+    "admin", "discretion", "panel", "committee",
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════

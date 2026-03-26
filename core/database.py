@@ -700,3 +700,32 @@ class MetricsEngine:
             var_95            = var_95,
             consecutive_losses= self.consecutive_losses(),
         )
+
+    def save_portfolio_snapshot(self, state: "PortfolioState") -> None:
+        """Persiste un snapshot de l'état du portefeuille dans portfolio_snapshots."""
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO portfolio_snapshots (
+                    ts, bankroll, total_exposure, open_positions,
+                    unrealized_pnl, realized_pnl, total_pnl,
+                    mdd_30d, brier_15, sharpe_30d, profit_factor,
+                    win_rate, var_95, consecutive_losses
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    state.bankroll,
+                    state.total_exposure,
+                    state.open_positions,
+                    state.unrealized_pnl,
+                    state.realized_pnl,
+                    state.total_pnl,
+                    state.mdd_30d,
+                    state.brier_15,
+                    state.sharpe_30d,
+                    state.profit_factor,
+                    state.win_rate,
+                    state.var_95,
+                    state.consecutive_losses,
+                ),
+            )
+            self.conn.commit()
