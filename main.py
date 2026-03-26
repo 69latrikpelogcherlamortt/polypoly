@@ -335,10 +335,11 @@ class TradingBot:
 
         # ── Kill switches ─────────────────────────────────────────────────
         ks = self.risk.check_kill_switches(self.bankroll, positions)
-        if ks.active and not ks.allow_new_trades:
+        kill_switch_active = ks.active and not ks.allow_new_trades
+        if kill_switch_active:
             log.warning(f"KILL SWITCH actif: {ks.reason}")
             await send_telegram(f"⚠ Kill Switch: {ks.reason}")
-            return
+            # Ne pas return ici — continuer la collecte pour maintenir le modèle Bayes à jour
 
         # ── Collecter signaux ─────────────────────────────────────────────
         alerts = await self.signals.collect_all(
@@ -370,11 +371,28 @@ class TradingBot:
         log.info(f"Crucix: {len(alerts)} signaux → {len(events)} événements")
 
         # ── Traiter les événements ─────────────────────────────────────────
+        if kill_switch_active:
+            # Pendant le kill switch : mettre à jour les p_model mais pas de nouveaux trades
+            log.info(f"KILL SWITCH: modèle mis à jour ({len(events)} événements), pas de trades")
+            for event in events:
+                await self._handle_crucix_event(event, positions, trading_blocked=True)
+            return
+
         for event in events:
             await self._handle_crucix_event(event, positions)
 
-    async def _handle_crucix_event(self, event: dict, positions: list[OpenPosition]):
-        """Traite un événement CrucixRouter — met à jour p_model et évalue action."""
+    async def _handle_crucix_event(
+        self,
+        event: dict,
+        positions: list[OpenPosition],
+        trading_blocked: bool = False,
+    ):
+        """Traite un événement CrucixRouter — met à jour p_model et évalue action.
+
+        Si trading_blocked=True (kill switch actif), on met quand même à jour
+        les p_model en DB pour maintenir le modèle Bayes à jour, mais on
+        n'ouvre aucun nouveau trade.
+        """
         action        = event.get("action", "HOLD")
         market_id     = event.get("market_id")
         p_model_new   = event.get("p_model_new")
@@ -395,7 +413,7 @@ class TradingBot:
                 f"Sources: {', '.join(event.get('sources', []))}"
             )
 
-        # Mise à jour de la position en DB
+        # Mise à jour de la position en DB (toujours, même pendant kill switch)
         pos = next((p for p in positions if p.market_id == market_id), None)
         if pos:
             cur_price  = p_market if p_market is not None else pos.current_price
@@ -409,6 +427,10 @@ class TradingBot:
                 new_z      = new_z,
                 days_to_res= pos.days_to_res,
             )
+
+        # Pas de décisions de trade si kill switch actif
+        if trading_blocked:
+            return
 
         # Si l'action suggère d'ajouter ou de rentrer
         if action in ("ADD_CONSIDER",):
