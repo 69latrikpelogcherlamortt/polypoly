@@ -87,8 +87,9 @@ AP_FEEDS = []  # AP ne sert plus de RSS public depuis 2023
 # ── Remplaçants Tier-1 (BBC + CNBC + MarketWatch + NPR) ──────────────────
 # Tous publics, pas d'auth, XML RSS valide, stables
 BBC_FEEDS = [
-    "http://feeds.bbci.co.uk/news/business/rss.xml",
-    "http://feeds.bbci.co.uk/news/world/us-canada/rss.xml",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",       # us-canada rss disparu → world
+    "https://feeds.bbci.co.uk/news/politics/rss.xml",
 ]
 CNBC_FEEDS = [
     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
